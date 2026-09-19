@@ -158,10 +158,16 @@ local testing only.
 
 **Still open — not fixed, listed so it isn't lost:**
 - **`net` (the airline/hotel fare) is still accepted from the client.** This backend has no live GDS/hotel feed of its own to verify it against yet — that's a larger, separate integration, not a quick fix here.
-- **No rate limiting** on any endpoint (OTP, booking creation, coupon redemption).
-- **CORS is still wide open** (`CORS(app)`) — restrict to your real frontend domain before deploying anywhere public-facing.
 - **No audit history.** Changing `MarkupConfig` overwrites the single row with no record of the previous value, who changed it, or when. Same for coupon/campaign edits. If "who changed the markup and when" needs to be answerable later, this needs an append-only audit log table, not yet built.
 - **agentFee is still client-supplied**, since it's a legitimate per-booking discretionary value an agent sets — but nothing here bounds it (e.g. a max % cap), so an agent-facing client could currently submit an unreasonable fee.
+
+**CORS — now environment-conditional, not a manual-edit comment:**
+Previously this was `CORS(app)` (allow-all) with a comment saying "restrict this before going live" — exactly the kind of thing that's easy to forget. It's now driven by the same `DEPLOY_ENV` variable as the rate-limiter gate: staging defaults to allow-all (convenient for testing from anywhere), but `DEPLOY_ENV=production` makes `CORS_ORIGINS` mandatory and **refuses to start** without it. Set `CORS_ORIGINS` in staging too, any time you want to test the restricted behavior early.
+
+**Rate limiting — added, with a known limitation to plan around:**
+`/api/send-otp` (5/10min per IP), `/api/verify-otp` (10/10min), `/api/resend-otp` (3/10min), and `POST /api/bookings` (10/10min) are now rate-limited per IP address. This closes the real financial risk of someone hammering the OTP-send endpoint and running up your MSG91 SMS bill, or flooding the database with fake bookings — both of which are public-by-necessity endpoints (real customers need to call them without logging in), so an admin key can't protect them the way it protects the dashboard endpoints.
+
+**The limitation to know about:** this is a simple in-memory counter, not Flask-Limiter + Redis. It works correctly on a single Render instance, but resets on every restart/redeploy, and won't share limits correctly if you ever scale to multiple instances. Fine for pre-prod; revisit before scaling past one instance.
 
 None of this is production-ready for real payments as-is. It's meaningfully safer than the version before this pass, and honest about exactly where the remaining risk sits.
 

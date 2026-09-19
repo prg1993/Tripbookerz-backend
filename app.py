@@ -40,9 +40,36 @@ from models import make_session, Booking, Coupon, Campaign, MarkupConfig
 
 app = Flask(__name__)
 
-# In production, lock this down to your real domain instead of "*".
-# e.g. CORS(app, origins=["https://www.tripbookerz.com"])
-CORS(app)
+# DEPLOY_ENV drives every environment-specific behavior in this file
+# (CORS below, and the rate-limiter startup gate further down) — defined
+# once, here, at the top, so there's a single source of truth instead of
+# scattered manual-edit comments.
+DEPLOY_ENV = os.environ.get("DEPLOY_ENV", "staging").lower()
+
+# CORS: staging defaults to allow-all for easy testing from any device/
+# tool without needing to know the exact origin in advance. Production
+# requires an explicit comma-separated allowlist and refuses to start
+# without one — wide-open CORS must never carry into production by default.
+_cors_origins_raw = os.environ.get("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+
+if DEPLOY_ENV == "production":
+    if not _cors_origins:
+        raise SystemExit(
+            "REFUSING TO START: DEPLOY_ENV=production requires CORS_ORIGINS "
+            "to be set explicitly — a comma-separated list of allowed "
+            "origins, e.g. 'https://www.tripbookerz.com'. Wide-open CORS "
+            "('*') is the staging default and must not reach production "
+            "silently."
+        )
+    CORS(app, origins=_cors_origins)
+elif _cors_origins:
+    # Staging with an explicit allowlist set — honor it (useful for
+    # testing the production-like restricted behavior before flipping
+    # DEPLOY_ENV itself).
+    CORS(app, origins=_cors_origins)
+else:
+    CORS(app)  # staging default: allow all
 
 MSG91_AUTH_KEY = os.environ.get("MSG91_AUTH_KEY")
 MSG91_TEMPLATE_ID = os.environ.get("MSG91_TEMPLATE_ID")
@@ -93,7 +120,61 @@ def normalize_mobile(mobile: str) -> str:
     return mobile
 
 
+# ---------- Rate limiting ----------
+# Deliberately dependency-free (in-memory dict) rather than Flask-Limiter,
+# since installing that couldn't be verified in the environment this was
+# built in (no network access). Good enough for a SINGLE Render instance
+# in pre-prod. Known limitation: this resets on every restart/redeploy,
+# and won't work correctly if you ever scale to multiple instances/workers
+# (each process has its own memory, so limits aren't shared between them).
+#
+# GUARDRAIL: rather than trust a comment or README note to be noticed,
+# this refuses to even start if DEPLOY_ENV=production is set without an
+# explicit opt-in — so accidentally deploying this weak limiter to real
+# production requires a conscious, named decision, not a silent default.
+from collections import defaultdict
+import time
+
+ALLOW_INMEMORY_RATE_LIMIT_IN_PROD = os.environ.get("ALLOW_INMEMORY_RATE_LIMIT_IN_PROD", "").lower() == "true"
+
+if DEPLOY_ENV == "production" and not ALLOW_INMEMORY_RATE_LIMIT_IN_PROD:
+    raise SystemExit(
+        "REFUSING TO START: DEPLOY_ENV=production is set, but this backend "
+        "still uses an in-memory, single-instance rate limiter — it will "
+        "silently stop working correctly the moment you run more than one "
+        "instance (each process gets its own separate counters, so real "
+        "limits multiply by instance count with no error or warning). "
+        "\n\nBefore going to real production, replace the rate limiter with "
+        "Flask-Limiter + Redis (or similar shared store). If you understand "
+        "this risk and want to proceed anyway (e.g. you're certain you'll "
+        "only ever run one instance), set "
+        "ALLOW_INMEMORY_RATE_LIMIT_IN_PROD=true explicitly — this is "
+        "deliberately not a default, so this can't happen by accident."
+    )
+
+_rate_buckets = defaultdict(list)
+
+def rate_limit(max_calls: int, window_seconds: int):
+    def decorator(fn):
+        def wrapper(*args, **kwargs):
+            ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+            key = f"{fn.__name__}:{ip}"
+            now = time.time()
+            bucket = _rate_buckets[key]
+            # drop timestamps outside the window
+            while bucket and bucket[0] < now - window_seconds:
+                bucket.pop(0)
+            if len(bucket) >= max_calls:
+                return jsonify(error="Too many requests. Please wait and try again."), 429
+            bucket.append(now)
+            return fn(*args, **kwargs)
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return decorator
+
+
 @app.route("/api/send-otp", methods=["POST"])
+@rate_limit(max_calls=5, window_seconds=600)  # 5 per 10 min per IP
 def send_otp():
     body = request.get_json(silent=True) or {}
     mobile = body.get("mobile", "")
@@ -113,6 +194,7 @@ def send_otp():
 
 
 @app.route("/api/verify-otp", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)  # 10 attempts per 10 min per IP
 def verify_otp():
     body = request.get_json(silent=True) or {}
     mobile = body.get("mobile", "")
@@ -133,6 +215,7 @@ def verify_otp():
 
 
 @app.route("/api/resend-otp", methods=["POST"])
+@rate_limit(max_calls=3, window_seconds=600)  # 3 per 10 min per IP
 def resend_otp():
     body = request.get_json(silent=True) or {}
     mobile = body.get("mobile", "")
@@ -154,7 +237,12 @@ def resend_otp():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify(status="ok", database=bool(Session))
+    return jsonify(
+        status="ok",
+        database=bool(Session),
+        deploy_env=DEPLOY_ENV,
+        rate_limiter="in-memory (single-instance only)",
+    )
 
 
 def db_required(fn):
@@ -194,6 +282,7 @@ def require_admin_key(fn):
 # ---------- Bookings ----------
 
 @app.route("/api/bookings", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)  # 10 per 10 min per IP
 @db_required
 def create_booking():
     """

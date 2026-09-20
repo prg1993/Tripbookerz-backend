@@ -76,6 +76,13 @@ MSG91_AUTH_KEY = os.environ.get("MSG91_AUTH_KEY")
 MSG91_TEMPLATE_ID = os.environ.get("MSG91_TEMPLATE_ID")
 MSG91_HOST = "control.msg91.com"
 
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+# Must be an address on a domain you've verified in Resend's dashboard
+# (DNS records). Until that's done, Resend only allows sending from its
+# own sandbox address — see .env.example / README for the exact caveat.
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "onboarding@resend.dev")
+RESEND_HOST = "api.resend.com"
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
 Session = None
 if DATABASE_URL:
@@ -91,6 +98,12 @@ if not MSG91_AUTH_KEY or not MSG91_TEMPLATE_ID:
         "WARNING: MSG91_AUTH_KEY / MSG91_TEMPLATE_ID are not set. "
         "Set them as environment variables before sending real OTPs. "
         "See .env.example."
+    )
+
+if not RESEND_API_KEY:
+    print(
+        "WARNING: RESEND_API_KEY is not set. Booking confirmation emails "
+        "will fail until it's configured. See .env.example."
     )
 
 
@@ -111,6 +124,38 @@ def msg91_request(method: str, path: str, params: dict):
     except ValueError:
         # MSG91 occasionally returns a plain string instead of JSON
         return res.status, {"message": raw}
+
+
+def send_email_via_resend(to_email, subject, html_body, attachment_filename=None, attachment_base64=None):
+    """Sends one email via Resend's REST API. Returns (ok: bool, raw response dict)."""
+    if not RESEND_API_KEY:
+        return False, {"error": "RESEND_API_KEY not configured on server"}
+
+    payload = {
+        "from": f"Tripbookerz <{EMAIL_FROM}>",
+        "to": [to_email],
+        "cc": ["support@tripbookerz.com"],
+        "subject": subject,
+        "html": html_body,
+    }
+    if attachment_filename and attachment_base64:
+        payload["attachments"] = [{"filename": attachment_filename, "content": attachment_base64}]
+
+    conn = http.client.HTTPSConnection(RESEND_HOST)
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    conn.request("POST", "/emails", body=json.dumps(payload), headers=headers)
+    res = conn.getresponse()
+    raw = res.read().decode("utf-8")
+    conn.close()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = {"message": raw}
+    ok = res.status in (200, 201) and "id" in data
+    return ok, data
 
 
 def normalize_mobile(mobile: str) -> str:
@@ -243,6 +288,29 @@ def resend_otp():
     }
     status, data = msg91_request("GET", "/api/v5/otp/retry", params)
     ok = status == 200 and data.get("type") == "success"
+    return jsonify(success=ok, raw=data), (200 if ok else 502)
+
+
+@app.route("/api/send-confirmation-email", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)  # 10 per 10 min per IP
+def send_confirmation_email():
+    """Sends a real booking confirmation email via Resend, with the
+    e-ticket/voucher PDF attached. Public and rate-limited for the same
+    reason send-otp is: real customers need to trigger this without
+    logging in, right after their booking is confirmed."""
+    body = request.get_json(silent=True) or {}
+    to_email = body.get("to")
+    subject = body.get("subject")
+    html_body = body.get("html")
+    pdf_filename = body.get("pdfFilename")
+    pdf_base64 = body.get("pdfBase64")
+
+    if not to_email or not subject or not html_body:
+        return jsonify(success=False, error="to, subject, and html are required"), 400
+    if not RESEND_API_KEY:
+        return jsonify(success=False, error="Email sending is not configured on the server"), 500
+
+    ok, data = send_email_via_resend(to_email, subject, html_body, pdf_filename, pdf_base64)
     return jsonify(success=ok, raw=data), (200 if ok else 502)
 
 

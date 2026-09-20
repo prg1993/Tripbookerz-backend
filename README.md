@@ -138,7 +138,32 @@ curl -X POST https://your-backend.onrender.com/api/admin/users \
 ```
 
 
+### Confirmation emails (Resend)
+
+**This replaces the previous fully-simulated email.** Booking confirmations
+are now sent for real, with the e-ticket/voucher PDF attached.
+
+Uses [Resend](https://resend.com), chosen specifically because its free
+tier is **permanent** (3,000 emails/month) — SendGrid's free tier was
+retired in 2025 and new signups now only get a 60-day trial before
+requiring payment, confirmed at the time this was built.
+
+1. Sign up at resend.com, get an **API key** (Dashboard → API Keys).
+2. To send from `no-reply@tripbookerz.com` (or any address on your real
+   domain), you must **verify that domain** in Resend (Dashboard →
+   Domains → Add Domain → add the DNS records they give you). **Until
+   that's done, Resend only delivers from its own sandbox address**
+   (`onboarding@resend.dev`) — sending from an unverified domain's
+   address fails outright, it doesn't silently work with reduced
+   deliverability.
+3. Set `RESEND_API_KEY` and `EMAIL_FROM` as described in `.env.example`.
+
+| Method | Path                          | Auth | Notes |
+|--------|-------------------------------|------|-------|
+| POST   | /api/send-confirmation-email  | none, rate-limited | `{ "to", "subject", "html", "pdfFilename"?, "pdfBase64"? }`. Public and rate-limited (10/10min/IP) for the same reason send-otp is — a real customer triggers this right after booking, without being logged in. Cc's support@tripbookerz.com automatically. |
+
 ### Bookings
+
 
 | Method | Path                     | Notes |
 |--------|--------------------------|-------|

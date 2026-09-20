@@ -158,6 +158,33 @@ def send_email_via_resend(to_email, subject, html_body, attachment_filename=None
     return ok, data
 
 
+def get_client_ip():
+    """Returns the real client IP, trusting only the hop closest to this
+    server (Render's own edge proxy), not whatever a client claims.
+
+    X-Forwarded-For is a comma-separated chain that proxies APPEND to,
+    they don't replace it. With exactly one trusted proxy (Render) in
+    front of this app, the LAST entry is the one Render's edge itself
+    observed and added — trustworthy. Any earlier entries could be
+    supplied by the client itself and are not trustworthy. Taking the
+    FIRST entry (the previous approach) let anyone bypass IP-based rate
+    limiting by just sending a different fake X-Forwarded-For value on
+    every request."""
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
+    return request.remote_addr or "unknown"
+
+
+def hash_token(token: str) -> str:
+    """Session tokens are stored hashed, never in plaintext — a database
+    compromise shouldn't also mean every active session is immediately
+    usable by whoever has the data."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def normalize_mobile(mobile: str) -> str:
     """Ensure the number carries the 91 country code, as MSG91 expects."""
     mobile = "".join(ch for ch in mobile if ch.isdigit())
@@ -203,7 +230,7 @@ _rate_buckets = defaultdict(list)
 def rate_limit(max_calls: int, window_seconds: int):
     def decorator(fn):
         def wrapper(*args, **kwargs):
-            ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+            ip = get_client_ip()
             key = f"{fn.__name__}:{ip}"
             now = time.time()
             bucket = _rate_buckets[key]
@@ -316,8 +343,16 @@ def send_confirmation_email():
 
 @app.route("/health", methods=["GET"])
 def health():
+    # Deliberately minimal — no auth required, so it must not leak
+    # anything useful for reconnaissance (env, DB connectivity, internal
+    # implementation details). See /api/admin/diagnostics for those.
+    return jsonify(status="ok")
+
+
+@app.route("/api/admin/diagnostics", methods=["GET"])
+@require_admin_auth
+def admin_diagnostics():
     return jsonify(
-        status="ok",
         database=bool(Session),
         deploy_env=DEPLOY_ENV,
         rate_limiter="in-memory (single-instance only)",
@@ -353,7 +388,7 @@ def resolve_admin_actor():
     if token and Session:
         session = Session()
         try:
-            admin = session.query(AdminUser).filter(AdminUser.session_token == token).first()
+            admin = session.query(AdminUser).filter(AdminUser.session_token == hash_token(token)).first()
             if admin and admin.status == "active" and admin.session_token_expires and datetime.utcnow() <= admin.session_token_expires:
                 return {"type": "admin_user", "id": admin.admin_id, "name": admin.name}
         finally:
@@ -400,7 +435,7 @@ def log_audit(session, action, target=None, details=None):
     session.commit() (or in the same commit) so the log and the change
     land together."""
     actor = getattr(g, "actor", None) or {"type": "unknown", "id": None, "name": "Unknown"}
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    ip = get_client_ip()
     entry = AuditLog(
         actor_type=actor["type"], actor_id=actor["id"], actor_name=actor["name"],
         action=action, target=target, details=details, ip_address=ip,
@@ -418,6 +453,7 @@ def log_audit(session, action, target=None, details=None):
 # production), then an admin must approve the account before it can log in.
 
 import re
+import hashlib
 from werkzeug.security import generate_password_hash, check_password_hash
 
 GST_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}Z[A-Z\d]{1}$")
@@ -601,7 +637,7 @@ def agent_login():
             return jsonify(error=f"Account not yet active (status: {agent.status})"), 403
 
         token = new_session_token()
-        agent.session_token = token
+        agent.session_token = hash_token(token)
         agent.session_token_expires = datetime.utcnow() + timedelta(hours=12)
         session.commit()
         return jsonify(success=True, token=token, agent=agent.to_dict())
@@ -621,7 +657,7 @@ def require_agent_auth(fn):
             return jsonify(error="Agent-Token header required"), 401
         session = Session()
         try:
-            agent = session.query(Agent).filter(Agent.session_token == token).first()
+            agent = session.query(Agent).filter(Agent.session_token == hash_token(token)).first()
             if not agent or agent.status != "approved":
                 return jsonify(error="Invalid session"), 401
             if not agent.session_token_expires or datetime.utcnow() > agent.session_token_expires:
@@ -782,7 +818,7 @@ def admin_login():
             return jsonify(error="This account has been disabled"), 403
 
         token = secrets.token_hex(32)
-        admin.session_token = token
+        admin.session_token = hash_token(token)
         admin.session_token_expires = datetime.utcnow() + timedelta(hours=12)
         g.actor = {"type": "admin_user", "id": admin.admin_id, "name": admin.name}
         log_audit(session, "admin_user.login", target=admin.admin_id)
@@ -912,7 +948,13 @@ def create_booking():
             booked_by_role=body["role"],
             traveler_name=traveler.get("name"),
             traveler_phone=traveler.get("phone"),
-            traveler_phone_verified=traveler.get("phoneVerified", False),
+            # NOT trusted from the client — see the flag's definition in
+            # models.py. A client claiming "true" here proves nothing;
+            # the real fix (a short-lived server-issued token from
+            # /api/verify-otp, required at booking time) is a larger
+            # change tracked separately. Storing the client's claim as
+            # fact would silently mislabel unverified data as verified.
+            traveler_phone_verified=False,
             traveler_email=traveler.get("email"),
             details=body.get("details", {}),
         )
@@ -1132,6 +1174,21 @@ def set_markup_config():
         return jsonify(success=True, config=cfg.to_dict())
     finally:
         session.close()
+
+
+from werkzeug.exceptions import HTTPException
+
+@app.errorhandler(Exception)
+def handle_uncaught_exception(e):
+    """Last-resort handler. Without this, an unexpected exception (a bug,
+    a bad input that slipped past validation, a DB hiccup) would let
+    Flask's default error page — which can include a stack trace — reach
+    the client. Every response from here is a stable, generic shape;
+    the real detail goes to server logs only."""
+    if isinstance(e, HTTPException):
+        return jsonify(error=e.description or "Request error"), e.code
+    print(f"UNHANDLED ERROR: {type(e).__name__}: {e}")
+    return jsonify(error="Internal server error"), 500
 
 
 if __name__ == "__main__":

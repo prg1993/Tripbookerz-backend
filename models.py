@@ -116,6 +116,114 @@ class MarkupConfig(Base):
         return {"type": self.type, "value": self.value}
 
 
+class Agent(Base):
+    __tablename__ = "agents"
+
+    agent_id = Column(String(32), primary_key=True)  # e.g. TBZAGT260917A8XQ2
+
+    entity_type = Column(String(20), nullable=False)   # individual | company
+    name = Column(String(255), nullable=False)          # company name or individual full name
+    registered_address = Column(String(500), nullable=False)
+
+    phone = Column(String(20), nullable=False)
+    phone_verified = Column(Boolean, default=False)
+
+    email = Column(String(255), nullable=False, unique=True)
+    email_verified = Column(Boolean, default=False)
+    email_verification_code = Column(String(10))
+    email_verification_expires = Column(DateTime)
+
+    gst_no = Column(String(20))   # format-validated, not verified against GSTN
+    pan_no = Column(String(10))
+
+    password_hash = Column(String(255), nullable=False)
+
+    # pending_verification -> pending_approval -> approved | rejected | suspended
+    status = Column(String(30), nullable=False, default="pending_verification")
+
+    session_token = Column(String(64))
+    session_token_expires = Column(DateTime)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    approved_at = Column(DateTime)
+
+    def to_dict(self, include_sensitive=False):
+        d = {
+            "agentId": self.agent_id,
+            "entityType": self.entity_type,
+            "name": self.name,
+            "registeredAddress": self.registered_address,
+            "phone": self.phone,
+            "phoneVerified": self.phone_verified,
+            "email": self.email,
+            "emailVerified": self.email_verified,
+            "gstNo": self.gst_no,
+            "panNo": self.pan_no,
+            "status": self.status,
+            "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
+            "approvedAt": self.approved_at.isoformat() + "Z" if self.approved_at else None,
+        }
+        return d
+
+
+class AdminUser(Base):
+    """A named employee account. Created only via the master ADMIN_API_KEY
+    (never through the public site) so account creation itself can't be
+    reached by a customer, and every admin action can be attributed to a
+    real person instead of a shared secret."""
+    __tablename__ = "admin_users"
+
+    admin_id = Column(String(32), primary_key=True)  # e.g. TBZADM260917A8XQ2
+    name = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=False, unique=True)
+    password_hash = Column(String(255), nullable=False)
+    status = Column(String(20), nullable=False, default="active")  # active | disabled
+
+    session_token = Column(String(64))
+    session_token_expires = Column(DateTime)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "adminId": self.admin_id,
+            "name": self.name,
+            "email": self.email,
+            "status": self.status,
+            "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
+        }
+
+
+class AuditLog(Base):
+    """Append-only record of every admin/employee action. Never updated or
+    deleted by the application — that's what makes it usable as an audit
+    trail rather than just a status field that gets overwritten."""
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    actor_type = Column(String(20), nullable=False)   # admin_user | master_key
+    actor_id = Column(String(32))                       # admin_id, or null for master_key
+    actor_name = Column(String(255), nullable=False)     # employee name, or "Master key"
+    action = Column(String(100), nullable=False)          # e.g. "coupon.create"
+    target = Column(String(255))                            # e.g. the coupon code affected
+    details = Column(JSON)                                    # before/after or other context
+    ip_address = Column(String(64))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "actorType": self.actor_type,
+            "actorId": self.actor_id,
+            "actorName": self.actor_name,
+            "action": self.action,
+            "target": self.target,
+            "details": self.details,
+            "ip": self.ip_address,
+            "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
+        }
+
+
 def make_session(database_url: str):
     """Create the engine + tables (if not already present) and return a session factory."""
     engine = create_engine(database_url, pool_pre_ping=True)

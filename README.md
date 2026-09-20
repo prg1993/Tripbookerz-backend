@@ -64,6 +64,80 @@ reports whether the database connected: `{"status":"ok","database":true}`.
 | POST   | /api/verify-otp    | `{ "mobile": "9545555638", "otp": "123456" }` |
 | POST   | /api/resend-otp    | `{ "mobile": "9545555638", "retrytype": "text" }` |
 
+### Agents (registration, verification, approval, login)
+
+Real authentication — replaces the frontend's old "click Agent to become
+an agent" button. Flow: **register → verify phone (real, MSG91) → verify
+email (see honest caveat below) → admin approves → agent can log in.**
+
+| Method | Path                              | Auth | Notes |
+|--------|-----------------------------------|------|-------|
+| POST   | /api/agents/register              | none | Body: `entityType` (individual/company), `name`, `registeredAddress`, `phone`, `email`, `password` (min 8 chars), `gstNo` (required if company; format-validated only, not checked against GSTN), `panNo` (optional). Triggers a real MSG91 OTP send. Rate-limited: 5/hour/IP. |
+| POST   | /api/agents/verify-phone          | none | `{ "agentId", "otp" }` — verifies against MSG91 for real. |
+| POST   | /api/agents/verify-email          | none | `{ "agentId", "code" }` — see email caveat below. |
+| POST   | /api/agents/resend-email-code     | none | `{ "agentId" }` |
+| POST   | /api/agents/login                 | none | `{ "email", "password" }` → returns a bearer `token` (only once `status` is `approved`). |
+| GET    | /api/agents/me                    | `Agent-Token` header | Confirms a session is valid, returns the agent's own record. |
+| GET    | /api/agents                       | `X-Admin-Key` | List all agents. `?status=pending_approval` filters. |
+| POST   | /api/agents/&lt;id&gt;/approve    | `X-Admin-Key` | Only works from `pending_approval` (i.e. both phone and email already verified). |
+| POST   | /api/agents/&lt;id&gt;/reject     | `X-Admin-Key` | |
+
+**Honest gap: email is not actually sent yet.** There's no email provider
+connected (SendGrid/SES/etc. — same gap flagged for booking confirmations
+earlier). In staging (`DEPLOY_ENV` != `production`), the verification code
+is returned directly in the `/register` and `/resend-email-code` response
+bodies (`dev_email_code`) so the full flow can still be tested end-to-end.
+**This must be replaced with a real email send before production** — right
+now a production deploy would generate a code that never reaches the
+agent, silently blocking every registration at the email-verification
+step. Worth wiring up before this matters for real users.
+
+**Session tokens** are a single opaque bearer token per agent (logging in
+again replaces the old one — no multi-device session list). 12-hour
+expiry. Sent as the `Agent-Token` header, not a cookie — deliberately
+avoids cross-origin cookie/SameSite complications since the frontend
+(Hostinger) and backend (Render) are different domains.
+
+### Admin employee accounts, login, audit log
+
+Replaces the single shared `X-Admin-Key` as something typed into the
+website. The master key still exists, but only as a **bootstrapping
+credential used outside the public site** (curl/Postman) to create named
+employee accounts — from then on, employees log in with their own
+email/password, and every admin action is attributed to a real person.
+
+| Method | Path                                 | Auth | Notes |
+|--------|---------------------------------------|------|-------|
+| POST   | /api/admin/users                      | Master key only | Create an employee account: `{ "name", "email", "password" }`. **Not reachable with an employee token** — see `require_master_key` — so no employee can mint more employee accounts. |
+| GET    | /api/admin/users                      | Master key only | List all employee accounts. |
+| POST   | /api/admin/users/&lt;id&gt;/disable   | Master key only | Immediately invalidates that employee's active session too. |
+| POST   | /api/admin/login                      | none | `{ "email", "password" }` → bearer token (`Admin-Token` header), 12h expiry. Rate-limited: 10/10min/IP. |
+| GET    | /api/admin/me                         | master key OR `Admin-Token` | Confirms a session/key is valid, returns the resolved actor. |
+| GET    | /api/admin/audit-log                  | master key OR `Admin-Token` | `?action=coupon.create`, `?actorId=TBZADM...`, `?limit=100` (max 500) to filter/page. |
+
+**Every existing admin-gated endpoint** (coupons, campaigns, markup
+config, agent approve/reject) now accepts **either** the master key or a
+real employee token — same protection level, but now attributes the
+action to whoever actually did it.
+
+**What gets logged, concretely:** `coupon.create`, `coupon.delete`,
+`campaign.create`, `campaign.toggle`, `markup_config.update` (captures
+before/after values), `agent.approve`, `agent.reject`,
+`admin_user.create`, `admin_user.disable`, `admin_user.login` — each
+entry has the actor's name/id, the action, the target, contextual
+details, IP address, and timestamp. The audit table is append-only —
+nothing in the application code updates or deletes a row once written.
+
+**Creating your first employee account** (there's no UI for this
+deliberately — see the "not visible to customers" note below):
+```bash
+curl -X POST https://your-backend.onrender.com/api/admin/users \
+  -H "X-Admin-Key: your-master-key" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Priya Sharma","email":"priya@tripbookerz.com","password":"a-real-password-here"}'
+```
+
+
 ### Bookings
 
 | Method | Path                     | Notes |
@@ -185,4 +259,26 @@ What *is* confirmed: both files compile cleanly (valid Python syntax) and
 follow correct SQLAlchemy 2.0 API patterns. The first real test of this
 code is the first time you run it against your actual Neon database —
 budget a little time for that before assuming it's production-ready.
+
+**Agent authentication (added most recently):** everything that doesn't
+require a live database was actually tested, not just written — password
+hashing (confirms a hash isn't the plaintext, correct password verifies,
+wrong password is rejected), GST format regex (tested against real GSTIN
+numbers, including one from a document you provided earlier, plus
+malformed examples), agent ID generation (1000 samples, all unique,
+correct format), session token generation (1000 samples, all unique),
+and verification-code expiry logic. The database-dependent parts
+(register/verify/approve/login actually writing to and reading from
+Postgres) have the same untested status as the rest of the DB layer —
+first real test is your first live run against Neon.
+
+**Admin employee accounts + audit log:** admin ID generation (1000
+samples, unique, correct format) and the two-tier auth resolution logic
+(master key match/mismatch, valid/expired employee token, neither
+provided) were tested standalone, including explicitly confirming an
+employee token can never satisfy `require_master_key` — that's the
+property preventing an employee from creating more employee accounts.
+Same caveat as everywhere else: the actual database reads/writes
+(creating accounts, logging in, writing audit rows) are untested until
+run against a live Neon database.
 

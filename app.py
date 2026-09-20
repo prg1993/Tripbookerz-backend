@@ -30,13 +30,14 @@ Booking/data endpoints (backed by Postgres, not localStorage):
 import os
 import http.client
 import json
+import secrets
 from urllib.parse import urlencode
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
-from models import make_session, Booking, Coupon, Campaign, MarkupConfig
+from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog
 
 app = Flask(__name__)
 
@@ -173,16 +174,10 @@ def rate_limit(max_calls: int, window_seconds: int):
     return decorator
 
 
-@app.route("/api/send-otp", methods=["POST"])
-@rate_limit(max_calls=5, window_seconds=600)  # 5 per 10 min per IP
-def send_otp():
-    body = request.get_json(silent=True) or {}
-    mobile = body.get("mobile", "")
-    if not mobile:
-        return jsonify(success=False, error="mobile is required"), 400
+def msg91_send_otp(mobile):
+    """Returns (ok: bool, raw response dict). Shared by /api/send-otp and agent registration."""
     if not MSG91_AUTH_KEY or not MSG91_TEMPLATE_ID:
-        return jsonify(success=False, error="Server OTP config missing"), 500
-
+        return False, {"error": "Server OTP config missing"}
     params = {
         "template_id": MSG91_TEMPLATE_ID,
         "mobile": normalize_mobile(mobile),
@@ -190,6 +185,31 @@ def send_otp():
     }
     status, data = msg91_request("POST", "/api/v5/otp", params)
     ok = status == 200 and data.get("type") == "success"
+    return ok, data
+
+
+def msg91_verify_otp(mobile, otp):
+    """Returns (verified: bool, raw response dict). Shared by /api/verify-otp and agent registration."""
+    if not MSG91_AUTH_KEY:
+        return False, {"error": "Server OTP config missing"}
+    params = {
+        "mobile": normalize_mobile(mobile),
+        "otp": otp,
+        "authkey": MSG91_AUTH_KEY,
+    }
+    status, data = msg91_request("GET", "/api/v5/otp/verify", params)
+    verified = status == 200 and data.get("type") == "success"
+    return verified, data
+
+
+@app.route("/api/send-otp", methods=["POST"])
+@rate_limit(max_calls=5, window_seconds=600)  # 5 per 10 min per IP
+def send_otp():
+    body = request.get_json(silent=True) or {}
+    mobile = body.get("mobile", "")
+    if not mobile:
+        return jsonify(success=False, error="mobile is required"), 400
+    ok, data = msg91_send_otp(mobile)
     return jsonify(success=ok, raw=data), (200 if ok else 502)
 
 
@@ -201,16 +221,7 @@ def verify_otp():
     otp = body.get("otp", "")
     if not mobile or not otp:
         return jsonify(success=False, error="mobile and otp are required"), 400
-    if not MSG91_AUTH_KEY:
-        return jsonify(success=False, error="Server OTP config missing"), 500
-
-    params = {
-        "mobile": normalize_mobile(mobile),
-        "otp": otp,
-        "authkey": MSG91_AUTH_KEY,
-    }
-    status, data = msg91_request("GET", "/api/v5/otp/verify", params)
-    verified = status == 200 and data.get("type") == "success"
+    verified, data = msg91_verify_otp(mobile, otp)
     return jsonify(verified=verified, raw=data), (200 if verified else 400)
 
 
@@ -263,20 +274,484 @@ if not ADMIN_API_KEY:
     )
 
 
-def require_admin_key(fn):
+def resolve_admin_actor():
+    """Checks X-Admin-Key (master key) OR Admin-Token (per-employee session).
+    Returns an actor dict on success, or None if neither is valid."""
+    provided_key = request.headers.get("X-Admin-Key")
+    if ADMIN_API_KEY and provided_key and provided_key == ADMIN_API_KEY:
+        return {"type": "master_key", "id": None, "name": "Master key"}
+
+    token = request.headers.get("Admin-Token")
+    if token and Session:
+        session = Session()
+        try:
+            admin = session.query(AdminUser).filter(AdminUser.session_token == token).first()
+            if admin and admin.status == "active" and admin.session_token_expires and datetime.utcnow() <= admin.session_token_expires:
+                return {"type": "admin_user", "id": admin.admin_id, "name": admin.name}
+        finally:
+            session.close()
+    return None
+
+
+def require_admin_auth(fn):
     """Guards endpoints that expose PII or control pricing/promotions.
-    NOTE: a single shared key is a stopgap for pre-prod, not real
-    multi-user auth with roles — replace with per-user accounts + roles
-    before this handles real agents/admins with different permissions."""
+    Accepts EITHER the master X-Admin-Key (intended only for bootstrapping
+    the first employee account(s) — see /api/admin/users) or a real
+    per-employee Admin-Token from /api/admin/login. Whichever is used,
+    the resolved actor is stashed on flask.g.actor so the route can log
+    who actually performed the action."""
     def wrapper(*args, **kwargs):
-        if not ADMIN_API_KEY:
-            return jsonify(error="Admin API key not configured on server"), 500
-        provided = request.headers.get("X-Admin-Key")
-        if not provided or provided != ADMIN_API_KEY:
+        actor = resolve_admin_actor()
+        if not actor:
             return jsonify(error="Unauthorized"), 401
+        g.actor = actor
         return fn(*args, **kwargs)
     wrapper.__name__ = fn.__name__
     return wrapper
+
+
+def require_master_key(fn):
+    """Stricter than require_admin_auth: ONLY the master X-Admin-Key works,
+    never a per-employee token. Used exclusively for creating/disabling
+    admin employee accounts, so a regular employee login can never be used
+    to mint more employee accounts (no privilege-escalation chain)."""
+    def wrapper(*args, **kwargs):
+        provided_key = request.headers.get("X-Admin-Key")
+        if not ADMIN_API_KEY or not provided_key or provided_key != ADMIN_API_KEY:
+            return jsonify(error="Unauthorized — master key required for account management"), 401
+        g.actor = {"type": "master_key", "id": None, "name": "Master key"}
+        return fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+
+def log_audit(session, action, target=None, details=None):
+    """Writes one append-only audit row using the actor resolved by
+    require_admin_auth. Call this AFTER a successful mutation, before
+    session.commit() (or in the same commit) so the log and the change
+    land together."""
+    actor = getattr(g, "actor", None) or {"type": "unknown", "id": None, "name": "Unknown"}
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    entry = AuditLog(
+        actor_type=actor["type"], actor_id=actor["id"], actor_name=actor["name"],
+        action=action, target=target, details=details, ip_address=ip,
+    )
+    session.add(entry)
+
+
+# ---------- Agents: registration, verification, approval, login ----------
+# Real authentication — this replaces the frontend's old "click Agent to
+# become an agent" button with an actual account system: register with
+# KYC-style details, verify phone (real, via MSG91) and email (code-based;
+# actual email SENDING isn't wired up yet — no provider connected — so in
+# staging the code is returned in the response so the flow can still be
+# tested end-to-end; this must be fixed with a real email provider before
+# production), then an admin must approve the account before it can log in.
+
+import re
+from werkzeug.security import generate_password_hash, check_password_hash
+
+GST_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}Z[A-Z\d]{1}$")
+
+def generate_agent_id():
+    ymd = datetime.utcnow().strftime("%y%m%d")
+    rand = secrets.token_hex(3).upper()
+    return "TBZAGT" + ymd + rand
+
+def hash_password(pw):
+    return generate_password_hash(pw)
+
+def verify_password(pw, pw_hash):
+    return check_password_hash(pw_hash, pw)
+
+def new_session_token():
+    return secrets.token_hex(32)  # 64-char opaque bearer token
+
+
+@app.route("/api/agents/register", methods=["POST"])
+@rate_limit(max_calls=5, window_seconds=3600)  # 5 registration attempts/hour/IP
+@db_required
+def register_agent():
+    body = request.get_json(silent=True) or {}
+    required = ["entityType", "name", "registeredAddress", "phone", "email", "password"]
+    missing = [f for f in required if not body.get(f)]
+    if missing:
+        return jsonify(error=f"Missing fields: {', '.join(missing)}"), 400
+
+    entity_type = body["entityType"]
+    if entity_type not in ("individual", "company"):
+        return jsonify(error="entityType must be 'individual' or 'company'"), 400
+
+    if len(body["password"]) < 8:
+        return jsonify(error="Password must be at least 8 characters"), 400
+
+    gst_no = (body.get("gstNo") or "").strip().upper() or None
+    if entity_type == "company" and not gst_no:
+        return jsonify(error="gstNo is required for company registrations"), 400
+    if gst_no and not GST_RE.match(gst_no):
+        return jsonify(error="gstNo format looks invalid (expected a 15-character GSTIN). Note: this checks format only, not against the government GSTN database."), 400
+
+    session = Session()
+    try:
+        if session.query(Agent).filter(Agent.email == body["email"]).first():
+            return jsonify(error="An account with this email already exists"), 409
+
+        agent = Agent(
+            agent_id=generate_agent_id(),
+            entity_type=entity_type,
+            name=body["name"],
+            registered_address=body["registeredAddress"],
+            phone=body["phone"],
+            email=body["email"],
+            gst_no=gst_no,
+            pan_no=(body.get("panNo") or "").strip().upper() or None,
+            password_hash=hash_password(body["password"]),
+            status="pending_verification",
+        )
+
+        # Trigger real phone OTP via MSG91.
+        ok, _ = msg91_send_otp(body["phone"])
+        if not ok:
+            return jsonify(error="Could not send phone verification OTP. Check MSG91 config."), 502
+
+        # Email verification code (actual sending not wired up yet — see note above).
+        code = str(secrets.randbelow(900000) + 100000)
+        agent.email_verification_code = code
+        agent.email_verification_expires = datetime.utcnow() + timedelta(minutes=30)
+
+        session.add(agent)
+        session.commit()
+
+        resp = {"success": True, "agentId": agent.agent_id, "status": agent.status}
+        if DEPLOY_ENV != "production":
+            resp["dev_note"] = "Email sending isn't configured yet — this code is exposed here ONLY because DEPLOY_ENV != production."
+            resp["dev_email_code"] = code
+        return jsonify(resp), 201
+    finally:
+        session.close()
+
+
+@app.route("/api/agents/verify-phone", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)
+@db_required
+def verify_agent_phone():
+    body = request.get_json(silent=True) or {}
+    agent_id = body.get("agentId")
+    otp = body.get("otp")
+    if not agent_id or not otp:
+        return jsonify(error="agentId and otp are required"), 400
+
+    session = Session()
+    try:
+        agent = session.get(Agent, agent_id)
+        if not agent:
+            return jsonify(error="Agent not found"), 404
+        verified, _ = msg91_verify_otp(agent.phone, otp)
+        if not verified:
+            return jsonify(verified=False, error="Incorrect or expired OTP"), 400
+        agent.phone_verified = True
+        if agent.phone_verified and agent.email_verified:
+            agent.status = "pending_approval"
+        session.commit()
+        return jsonify(verified=True, status=agent.status)
+    finally:
+        session.close()
+
+
+@app.route("/api/agents/verify-email", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)
+@db_required
+def verify_agent_email():
+    body = request.get_json(silent=True) or {}
+    agent_id = body.get("agentId")
+    code = body.get("code")
+    if not agent_id or not code:
+        return jsonify(error="agentId and code are required"), 400
+
+    session = Session()
+    try:
+        agent = session.get(Agent, agent_id)
+        if not agent:
+            return jsonify(error="Agent not found"), 404
+        if not agent.email_verification_code or agent.email_verification_code != code:
+            return jsonify(verified=False, error="Incorrect code"), 400
+        if not agent.email_verification_expires or datetime.utcnow() > agent.email_verification_expires:
+            return jsonify(verified=False, error="Code expired — request a new one"), 400
+        agent.email_verified = True
+        agent.email_verification_code = None
+        if agent.phone_verified and agent.email_verified:
+            agent.status = "pending_approval"
+        session.commit()
+        return jsonify(verified=True, status=agent.status)
+    finally:
+        session.close()
+
+
+@app.route("/api/agents/resend-email-code", methods=["POST"])
+@rate_limit(max_calls=3, window_seconds=600)
+@db_required
+def resend_agent_email_code():
+    body = request.get_json(silent=True) or {}
+    agent_id = body.get("agentId")
+    if not agent_id:
+        return jsonify(error="agentId is required"), 400
+    session = Session()
+    try:
+        agent = session.get(Agent, agent_id)
+        if not agent:
+            return jsonify(error="Agent not found"), 404
+        code = str(secrets.randbelow(900000) + 100000)
+        agent.email_verification_code = code
+        agent.email_verification_expires = datetime.utcnow() + timedelta(minutes=30)
+        session.commit()
+        resp = {"success": True}
+        if DEPLOY_ENV != "production":
+            resp["dev_email_code"] = code
+        return jsonify(resp)
+    finally:
+        session.close()
+
+
+@app.route("/api/agents/login", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)
+@db_required
+def agent_login():
+    body = request.get_json(silent=True) or {}
+    email = body.get("email")
+    password = body.get("password")
+    if not email or not password:
+        return jsonify(error="email and password are required"), 400
+
+    session = Session()
+    try:
+        agent = session.query(Agent).filter(Agent.email == email).first()
+        # Deliberately generic error (don't reveal whether the email exists).
+        if not agent or not verify_password(password, agent.password_hash):
+            return jsonify(error="Invalid email or password"), 401
+        if agent.status != "approved":
+            return jsonify(error=f"Account not yet active (status: {agent.status})"), 403
+
+        token = new_session_token()
+        agent.session_token = token
+        agent.session_token_expires = datetime.utcnow() + timedelta(hours=12)
+        session.commit()
+        return jsonify(success=True, token=token, agent=agent.to_dict())
+    finally:
+        session.close()
+
+
+def require_agent_auth(fn):
+    """Validates the Agent-Token header against an approved agent's active
+    session, and passes the agent's dict as the first argument to the
+    wrapped function."""
+    def wrapper(*args, **kwargs):
+        if not Session:
+            return jsonify(error="Database not configured"), 500
+        token = request.headers.get("Agent-Token")
+        if not token:
+            return jsonify(error="Agent-Token header required"), 401
+        session = Session()
+        try:
+            agent = session.query(Agent).filter(Agent.session_token == token).first()
+            if not agent or agent.status != "approved":
+                return jsonify(error="Invalid session"), 401
+            if not agent.session_token_expires or datetime.utcnow() > agent.session_token_expires:
+                return jsonify(error="Session expired, please log in again"), 401
+            return fn(agent.to_dict(), *args, **kwargs)
+        finally:
+            session.close()
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+@app.route("/api/agents/me", methods=["GET"])
+@require_agent_auth
+def agent_me(agent):
+    return jsonify(agent)
+
+
+# ---------- Admin: agent approval ----------
+
+@app.route("/api/agents", methods=["GET"])
+@require_admin_auth
+@db_required
+def list_agents():
+    status_filter = request.args.get("status")
+    session = Session()
+    try:
+        q = session.query(Agent).order_by(Agent.created_at.desc())
+        if status_filter:
+            q = q.filter(Agent.status == status_filter)
+        return jsonify([a.to_dict() for a in q.all()])
+    finally:
+        session.close()
+
+
+@app.route("/api/agents/<agent_id>/approve", methods=["POST"])
+@require_admin_auth
+@db_required
+def approve_agent(agent_id):
+    session = Session()
+    try:
+        agent = session.get(Agent, agent_id)
+        if not agent:
+            return jsonify(error="Not found"), 404
+        if agent.status != "pending_approval":
+            return jsonify(error=f"Cannot approve from status '{agent.status}' — phone and email must be verified first"), 400
+        agent.status = "approved"
+        agent.approved_at = datetime.utcnow()
+        log_audit(session, "agent.approve", target=agent_id, details={"agentName": agent.name, "agentEmail": agent.email})
+        session.commit()
+        return jsonify(success=True, agent=agent.to_dict())
+    finally:
+        session.close()
+
+
+@app.route("/api/agents/<agent_id>/reject", methods=["POST"])
+@require_admin_auth
+@db_required
+def reject_agent(agent_id):
+    session = Session()
+    try:
+        agent = session.get(Agent, agent_id)
+        if not agent:
+            return jsonify(error="Not found"), 404
+        agent.status = "rejected"
+        log_audit(session, "agent.reject", target=agent_id, details={"agentName": agent.name, "agentEmail": agent.email})
+        session.commit()
+        return jsonify(success=True, agent=agent.to_dict())
+    finally:
+        session.close()
+
+
+# ---------- Admin employee accounts, login, audit log ----------
+
+def generate_admin_id():
+    ymd = datetime.utcnow().strftime("%y%m%d")
+    rand = secrets.token_hex(3).upper()
+    return "TBZADM" + ymd + rand
+
+
+@app.route("/api/admin/users", methods=["POST"])
+@require_master_key
+@db_required
+def create_admin_user():
+    """Master-key-only, deliberately not reachable with a regular employee
+    token — see require_master_key's docstring for why."""
+    body = request.get_json(silent=True) or {}
+    required = ["name", "email", "password"]
+    missing = [f for f in required if not body.get(f)]
+    if missing:
+        return jsonify(error=f"Missing fields: {', '.join(missing)}"), 400
+    if len(body["password"]) < 8:
+        return jsonify(error="Password must be at least 8 characters"), 400
+
+    session = Session()
+    try:
+        if session.query(AdminUser).filter(AdminUser.email == body["email"]).first():
+            return jsonify(error="An admin account with this email already exists"), 409
+        admin = AdminUser(
+            admin_id=generate_admin_id(),
+            name=body["name"], email=body["email"],
+            password_hash=generate_password_hash(body["password"]),
+            status="active",
+        )
+        session.add(admin)
+        log_audit(session, "admin_user.create", target=admin.admin_id, details={"name": body["name"], "email": body["email"]})
+        session.commit()
+        return jsonify(success=True, admin=admin.to_dict()), 201
+    finally:
+        session.close()
+
+
+@app.route("/api/admin/users", methods=["GET"])
+@require_master_key
+@db_required
+def list_admin_users():
+    session = Session()
+    try:
+        return jsonify([a.to_dict() for a in session.query(AdminUser).order_by(AdminUser.created_at.desc()).all()])
+    finally:
+        session.close()
+
+
+@app.route("/api/admin/users/<admin_id>/disable", methods=["POST"])
+@require_master_key
+@db_required
+def disable_admin_user(admin_id):
+    session = Session()
+    try:
+        admin = session.get(AdminUser, admin_id)
+        if not admin:
+            return jsonify(error="Not found"), 404
+        admin.status = "disabled"
+        admin.session_token = None  # immediately invalidate any active session
+        log_audit(session, "admin_user.disable", target=admin_id, details={"name": admin.name, "email": admin.email})
+        session.commit()
+        return jsonify(success=True, admin=admin.to_dict())
+    finally:
+        session.close()
+
+
+@app.route("/api/admin/login", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)
+@db_required
+def admin_login():
+    body = request.get_json(silent=True) or {}
+    email = body.get("email")
+    password = body.get("password")
+    if not email or not password:
+        return jsonify(error="email and password are required"), 400
+
+    session = Session()
+    try:
+        admin = session.query(AdminUser).filter(AdminUser.email == email).first()
+        # Deliberately generic error (don't reveal whether the email exists).
+        if not admin or not check_password_hash(admin.password_hash, password):
+            return jsonify(error="Invalid email or password"), 401
+        if admin.status != "active":
+            return jsonify(error="This account has been disabled"), 403
+
+        token = secrets.token_hex(32)
+        admin.session_token = token
+        admin.session_token_expires = datetime.utcnow() + timedelta(hours=12)
+        g.actor = {"type": "admin_user", "id": admin.admin_id, "name": admin.name}
+        log_audit(session, "admin_user.login", target=admin.admin_id)
+        session.commit()
+        return jsonify(success=True, token=token, admin=admin.to_dict())
+    finally:
+        session.close()
+
+
+@app.route("/api/admin/me", methods=["GET"])
+@require_admin_auth
+def admin_me():
+    return jsonify(g.actor)
+
+
+@app.route("/api/admin/audit-log", methods=["GET"])
+@require_admin_auth
+@db_required
+def get_audit_log():
+    """Any authenticated admin (master key or employee) can view the log —
+    read access to 'who changed what' shouldn't itself require the master
+    key. Filter with ?action=coupon.create or ?actorId=TBZADM..., and page
+    with ?limit=50 (default 100, capped at 500)."""
+    action_filter = request.args.get("action")
+    actor_filter = request.args.get("actorId")
+    limit = min(int(request.args.get("limit", 100)), 500)
+
+    session = Session()
+    try:
+        q = session.query(AuditLog).order_by(AuditLog.created_at.desc())
+        if action_filter:
+            q = q.filter(AuditLog.action == action_filter)
+        if actor_filter:
+            q = q.filter(AuditLog.actor_id == actor_filter)
+        return jsonify([e.to_dict() for e in q.limit(limit).all()])
+    finally:
+        session.close()
 
 
 # ---------- Bookings ----------
@@ -381,7 +856,7 @@ def create_booking():
 
 
 @app.route("/api/bookings", methods=["GET"])
-@require_admin_key
+@require_admin_auth
 @db_required
 def list_bookings():
     role = request.args.get("role")
@@ -396,7 +871,7 @@ def list_bookings():
 
 
 @app.route("/api/bookings/<id_or_ref>", methods=["GET"])
-@require_admin_key
+@require_admin_auth
 @db_required
 def get_booking(id_or_ref):
     session = Session()
@@ -415,7 +890,7 @@ def get_booking(id_or_ref):
 # ---------- Coupons ----------
 
 @app.route("/api/coupons", methods=["POST"])
-@require_admin_key
+@require_admin_auth
 @db_required
 def create_coupon():
     body = request.get_json(silent=True) or {}
@@ -435,6 +910,7 @@ def create_coupon():
             max_uses=body.get("max", 1), used=0,
         )
         session.add(coupon)
+        log_audit(session, "coupon.create", target=code, details={"type": body["type"], "value": body["value"], "from": body["from"], "to": body["to"], "max": body.get("max", 1)})
         session.commit()
         return jsonify(success=True, coupon=coupon.to_dict()), 201
     finally:
@@ -442,7 +918,7 @@ def create_coupon():
 
 
 @app.route("/api/coupons", methods=["GET"])
-@require_admin_key
+@require_admin_auth
 @db_required
 def list_coupons():
     session = Session()
@@ -453,7 +929,7 @@ def list_coupons():
 
 
 @app.route("/api/coupons/<code>", methods=["DELETE"])
-@require_admin_key
+@require_admin_auth
 @db_required
 def delete_coupon(code):
     session = Session()
@@ -461,6 +937,7 @@ def delete_coupon(code):
         coupon = session.get(Coupon, code.strip().upper())
         if not coupon:
             return jsonify(error="Not found"), 404
+        log_audit(session, "coupon.delete", target=coupon.code, details={"type": coupon.type, "value": coupon.value, "used": coupon.used})
         session.delete(coupon)
         session.commit()
         return jsonify(success=True)
@@ -503,7 +980,7 @@ def use_coupon(code):
 # ---------- Campaigns ----------
 
 @app.route("/api/campaigns", methods=["POST"])
-@require_admin_key
+@require_admin_auth
 @db_required
 def create_campaign():
     body = request.get_json(silent=True) or {}
@@ -513,6 +990,8 @@ def create_campaign():
     try:
         campaign = Campaign(title=body["title"], tag=body.get("tag", ""), active=True)
         session.add(campaign)
+        session.flush()  # get campaign.id before logging, since it's autoincrement
+        log_audit(session, "campaign.create", target=str(campaign.id), details={"title": body["title"], "tag": body.get("tag", "")})
         session.commit()
         return jsonify(success=True, campaign=campaign.to_dict()), 201
     finally:
@@ -531,7 +1010,7 @@ def list_campaigns():
 
 
 @app.route("/api/campaigns/<int:campaign_id>", methods=["PATCH"])
-@require_admin_key
+@require_admin_auth
 @db_required
 def toggle_campaign(campaign_id):
     session = Session()
@@ -540,6 +1019,7 @@ def toggle_campaign(campaign_id):
         if not campaign:
             return jsonify(error="Not found"), 404
         campaign.active = not campaign.active
+        log_audit(session, "campaign.toggle", target=str(campaign_id), details={"title": campaign.title, "newActive": campaign.active})
         session.commit()
         return jsonify(success=True, campaign=campaign.to_dict())
     finally:
@@ -564,7 +1044,7 @@ def get_markup_config():
 
 
 @app.route("/api/markup-config", methods=["PUT"])
-@require_admin_key
+@require_admin_auth
 @db_required
 def set_markup_config():
     body = request.get_json(silent=True) or {}
@@ -576,8 +1056,10 @@ def set_markup_config():
         if not cfg:
             cfg = MarkupConfig(id=1)
             session.add(cfg)
+        before = {"type": cfg.type, "value": cfg.value}
         cfg.type = body["type"]
         cfg.value = body["value"]
+        log_audit(session, "markup_config.update", target="markup_config", details={"before": before, "after": {"type": body["type"], "value": body["value"]}})
         session.commit()
         return jsonify(success=True, config=cfg.to_dict())
     finally:

@@ -64,6 +64,33 @@ reports whether the database connected: `{"status":"ok","database":true}`.
 | POST   | /api/verify-otp    | `{ "mobile": "9545555638", "otp": "123456" }` |
 | POST   | /api/resend-otp    | `{ "mobile": "9545555638", "retrytype": "text" }` |
 
+**Provider is swappable via one environment variable — `OTP_PROVIDER`
+(`msg91` or `message_central`), no code change needed.** These routes,
+agent registration's phone verification, and everything else in the app
+call a generic `send_otp_via_provider()` / `verify_otp_via_provider()`
+dispatcher — never a specific provider's function directly. The dispatch
+table lives in one place (`_OTP_PROVIDERS` in `app.py`); adding a third
+provider later means writing its adapter (matching the same
+`(ok, raw)` / `(verified, raw)` return shape) and adding one line there.
+
+**Why Message Central exists as an option**: its pre-approved shared DLT
+route lets sending start immediately, without MSG91's multi-day DLT
+registration wait — a real practical advantage if you want to start
+testing sooner. Confirmed current (exact endpoints, response shapes,
+error codes) via their published API tutorial when this was built.
+
+**A structural difference the abstraction hides, worth knowing about
+if you're debugging**: MSG91's verify step only needs `(mobile, otp)`
+again. Message Central's verify step needs the `verificationId` their
+own send call returned — passing just the mobile number isn't enough
+for their API. Rather than change the public API shape to carry that
+through, the Message Central adapter caches `verificationId` in memory,
+keyed by normalized mobile number, entirely inside `app.py` — invisible
+to routes, the frontend, and everything else. Same known limitation as
+the in-memory rate limiter: this cache is per-process, fine for one
+Render instance, would need a shared store (Redis) before scaling to
+multiple instances.
+
 ### Agents (registration, verification, approval, login)
 
 Real authentication — replaces the frontend's old "click Agent to become

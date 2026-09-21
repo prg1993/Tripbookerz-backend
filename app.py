@@ -31,6 +31,7 @@ import os
 import http.client
 import json
 import secrets
+import base64
 from urllib.parse import urlencode
 from datetime import datetime, timedelta
 
@@ -276,7 +277,7 @@ def rate_limit(max_calls: int, window_seconds: int):
 
 
 def msg91_send_otp(mobile):
-    """Returns (ok: bool, raw response dict). Shared by /api/send-otp and agent registration."""
+    """Returns (ok: bool, raw response dict)."""
     if not MSG91_AUTH_KEY or not MSG91_TEMPLATE_ID:
         return False, {"error": "Server OTP config missing"}
     params = {
@@ -290,7 +291,7 @@ def msg91_send_otp(mobile):
 
 
 def msg91_verify_otp(mobile, otp):
-    """Returns (verified: bool, raw response dict). Shared by /api/verify-otp and agent registration."""
+    """Returns (verified: bool, raw response dict)."""
     if not MSG91_AUTH_KEY:
         return False, {"error": "Server OTP config missing"}
     params = {
@@ -303,6 +304,172 @@ def msg91_verify_otp(mobile, otp):
     return verified, data
 
 
+# ---------- Message Central (VerifyNow) adapter ----------
+# Chosen as an alternative to MSG91 specifically because its pre-approved
+# shared DLT route lets sending start immediately, without MSG91's
+# multi-day DLT registration wait.
+#
+# Structural difference from MSG91 that this adapter exists to hide:
+# MSG91's verify step just needs (mobile, otp) again — nothing to carry
+# over from the send call. Message Central's verify step needs the
+# `verificationId` that ITS send call returned; passing the mobile number
+# alone isn't enough for their API. Rather than surface that difference
+# to every caller (routes, agent registration), this adapter caches the
+# verificationId in memory, keyed by normalized mobile, so the rest of
+# the app can keep calling send_otp(mobile) / verify_otp(mobile, otp) —
+# identical signature regardless of which provider is behind it.
+#
+# Known limitation, same class as the rate limiter: this cache is
+# in-memory and per-process. Fine for a single Render instance; would
+# need a shared store (Redis) before scaling to multiple instances,
+# same as already documented for rate limiting.
+MC_HOST = "cpaas.messagecentral.com"
+MC_CUSTOMER_ID = os.environ.get("MC_CUSTOMER_ID")
+MC_PASSWORD = os.environ.get("MC_PASSWORD")
+MC_EMAIL = os.environ.get("MC_EMAIL")
+
+_mc_token = None
+_mc_token_fetched_at = 0
+_mc_token_ttl_seconds = 20 * 3600  # refresh well before their ~24h expiry
+_mc_verification_ids = {}  # normalized mobile -> verificationId, in-memory only
+
+
+def _mc_request(method, path, params=None, headers=None):
+    conn = http.client.HTTPSConnection(MC_HOST)
+    query = ("?" + urlencode(params)) if params else ""
+    conn.request(method, path + query, headers=headers or {"accept": "*/*"})
+    res = conn.getresponse()
+    raw = res.read().decode("utf-8")
+    conn.close()
+    try:
+        return res.status, json.loads(raw)
+    except ValueError:
+        return res.status, {"message": raw}
+
+
+def _mc_get_token():
+    """Fetches and caches an auth token. Message Central's own docs recommend
+    caching rather than fetching one per call — TTL is roughly 24h."""
+    global _mc_token, _mc_token_fetched_at
+    if _mc_token and (time.time() - _mc_token_fetched_at) < _mc_token_ttl_seconds:
+        return _mc_token
+    if not (MC_CUSTOMER_ID and MC_PASSWORD):
+        return None
+    key = base64.b64encode(MC_PASSWORD.encode()).decode()
+    params = {"customerId": MC_CUSTOMER_ID, "key": key, "scope": "NEW", "country": "91"}
+    if MC_EMAIL:
+        params["email"] = MC_EMAIL
+    status, data = _mc_request("GET", "/auth/v1/authentication/token", params)
+    if status == 200 and data.get("token"):
+        _mc_token = data["token"]
+        _mc_token_fetched_at = time.time()
+        return _mc_token
+    return None
+
+
+def message_central_send_otp(mobile):
+    """Returns (ok: bool, raw response dict). Same external signature as
+    msg91_send_otp — the verificationId this provider needs internally is
+    cached here, not exposed to the caller."""
+    if not (MC_CUSTOMER_ID and MC_PASSWORD):
+        return False, {"error": "Server OTP config missing (MC_CUSTOMER_ID/MC_PASSWORD)"}
+    token = _mc_get_token()
+    if not token:
+        return False, {"error": "Could not authenticate with Message Central"}
+
+    digits = "".join(ch for ch in mobile if ch.isdigit())
+    ten_digit = digits[-10:] if len(digits) >= 10 else digits
+    params = {"countryCode": "91", "flowType": "SMS", "mobileNumber": ten_digit, "otpLength": "6"}
+    status, data = _mc_request("POST", "/verification/v3/send", params, headers={"authToken": token})
+    ok = status == 200 and data.get("responseCode") == 200
+    if ok:
+        verification_id = data.get("data", {}).get("verificationId")
+        if verification_id:
+            _mc_verification_ids[normalize_mobile(mobile)] = verification_id
+    return ok, data
+
+
+def message_central_verify_otp(mobile, otp):
+    """Returns (verified: bool, raw response dict). Same external signature
+    as msg91_verify_otp."""
+    verification_id = _mc_verification_ids.get(normalize_mobile(mobile))
+    if not verification_id:
+        return False, {"error": "No pending OTP found for this number — please request a new OTP"}
+    token = _mc_get_token()
+    if not token:
+        return False, {"error": "Could not authenticate with Message Central"}
+
+    params = {"verificationId": verification_id, "code": otp}
+    status, data = _mc_request("GET", "/verification/v3/validateOtp", params, headers={"authToken": token})
+    verified = (
+        status == 200
+        and data.get("responseCode") == 200
+        and data.get("data", {}).get("verificationStatus") == "VERIFICATION_COMPLETED"
+    )
+    if verified:
+        _mc_verification_ids.pop(normalize_mobile(mobile), None)
+    return verified, data
+
+
+# ---------- Generic OTP provider dispatch ----------
+# THIS is what makes switching providers "just a config change": every
+# route and every other function in this app calls send_otp_via_provider()/
+# verify_otp_via_provider() below — never msg91_send_otp() or
+# message_central_send_otp() directly. Named with the _via_provider suffix
+# specifically so they can't collide with the /api/send-otp and
+# /api/verify-otp Flask route functions, which are separately named
+# send_otp()/verify_otp() for their URL — two same-named functions at
+# module level would silently shadow each other.
+# Adding a third provider later means writing its adapter (matching the
+# same (ok, raw) / (verified, raw) return shape) and adding one line to
+# the dict below — nothing else in the app needs to change.
+OTP_PROVIDER = os.environ.get("OTP_PROVIDER", "msg91").lower()
+_OTP_PROVIDERS = {
+    "msg91": (msg91_send_otp, msg91_verify_otp),
+    "message_central": (message_central_send_otp, message_central_verify_otp),
+}
+if OTP_PROVIDER not in _OTP_PROVIDERS:
+    print(f"WARNING: OTP_PROVIDER='{OTP_PROVIDER}' is not recognized (expected 'msg91' or "
+          f"'message_central'). Falling back to 'msg91'.")
+    OTP_PROVIDER = "msg91"
+
+
+def send_otp_via_provider(mobile):
+    return _OTP_PROVIDERS[OTP_PROVIDER][0](mobile)
+
+
+def verify_otp_via_provider(mobile, otp):
+    return _OTP_PROVIDERS[OTP_PROVIDER][1](mobile, otp)
+
+
+def msg91_resend_otp(mobile, retry_type):
+    if not MSG91_AUTH_KEY:
+        return False, {"error": "Server OTP config missing"}
+    params = {"mobile": normalize_mobile(mobile), "retrytype": retry_type, "authkey": MSG91_AUTH_KEY}
+    status, data = msg91_request("GET", "/api/v5/otp/retry", params)
+    ok = status == 200 and data.get("type") == "success"
+    return ok, data
+
+
+def message_central_resend_otp(mobile, retry_type):
+    # Message Central has no distinct voice/text "retry" endpoint in their
+    # documented API — a resend is just another send, which naturally
+    # issues a fresh verificationId (overwriting the cached one, which is
+    # exactly the correct behavior: the old one should stop being valid).
+    # retry_type is accepted for interface compatibility but not used.
+    return message_central_send_otp(mobile)
+
+
+_OTP_RESEND_PROVIDERS = {
+    "msg91": msg91_resend_otp,
+    "message_central": message_central_resend_otp,
+}
+
+
+def resend_otp_via_provider(mobile, retry_type):
+    return _OTP_RESEND_PROVIDERS[OTP_PROVIDER](mobile, retry_type)
+
+
 @app.route("/api/send-otp", methods=["POST"])
 @rate_limit(max_calls=5, window_seconds=600)  # 5 per 10 min per IP
 def send_otp():
@@ -310,7 +477,7 @@ def send_otp():
     mobile = body.get("mobile", "")
     if not mobile:
         return jsonify(success=False, error="mobile is required"), 400
-    ok, data = msg91_send_otp(mobile)
+    ok, data = send_otp_via_provider(mobile)
     return jsonify(success=ok, raw=data), (200 if ok else 502)
 
 
@@ -322,7 +489,7 @@ def verify_otp():
     otp = body.get("otp", "")
     if not mobile or not otp:
         return jsonify(success=False, error="mobile and otp are required"), 400
-    verified, data = msg91_verify_otp(mobile, otp)
+    verified, data = verify_otp_via_provider(mobile, otp)
     return jsonify(verified=verified, raw=data), (200 if verified else 400)
 
 
@@ -331,19 +498,10 @@ def verify_otp():
 def resend_otp():
     body = request.get_json(silent=True) or {}
     mobile = body.get("mobile", "")
-    retry_type = body.get("retrytype", "text")  # "text" or "voice"
+    retry_type = body.get("retrytype", "text")  # "text" or "voice" — MSG91-specific, ignored by other providers
     if not mobile:
         return jsonify(success=False, error="mobile is required"), 400
-    if not MSG91_AUTH_KEY:
-        return jsonify(success=False, error="Server OTP config missing"), 500
-
-    params = {
-        "mobile": normalize_mobile(mobile),
-        "retrytype": retry_type,
-        "authkey": MSG91_AUTH_KEY,
-    }
-    status, data = msg91_request("GET", "/api/v5/otp/retry", params)
-    ok = status == 200 and data.get("type") == "success"
+    ok, data = resend_otp_via_provider(mobile, retry_type)
     return jsonify(success=ok, raw=data), (200 if ok else 502)
 
 
@@ -544,7 +702,7 @@ def register_agent():
         )
 
         # Trigger real phone OTP via MSG91.
-        ok, _ = msg91_send_otp(body["phone"])
+        ok, _ = send_otp_via_provider(body["phone"])
         if not ok:
             return jsonify(error="Could not send phone verification OTP. Check MSG91 config."), 502
 
@@ -580,7 +738,7 @@ def verify_agent_phone():
         agent = session.get(Agent, agent_id)
         if not agent:
             return jsonify(error="Agent not found"), 404
-        verified, _ = msg91_verify_otp(agent.phone, otp)
+        verified, _ = verify_otp_via_provider(agent.phone, otp)
         if not verified:
             return jsonify(verified=False, error="Incorrect or expired OTP"), 400
         agent.phone_verified = True

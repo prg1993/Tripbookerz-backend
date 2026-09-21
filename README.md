@@ -164,12 +164,26 @@ requiring payment, confirmed at the time this was built.
 
 ### Bookings
 
+| Method | Path                              | Notes |
+|--------|------------------------------------|-------|
+| POST   | /api/bookings                     | Create a booking. Body matches the frontend's booking record shape (`bookingId`, `pnr`, `kind`, `title`, `net`, `platformFee`, `agentFee`, `discount`, `total`, `role`, `traveler`, `details`). |
+| GET    | /api/bookings                     | List all, newest first. `?role=agent` filters. |
+| GET    | /api/bookings/&lt;id&gt;          | Admin-only. Look up by Tripbookerz Booking ID **or** the airline/hotel partner reference. |
+| POST   | /api/bookings/lookup              | **Public**, rate-limited. `{ "bookingId", "phone" }` — both must match before anything is returned. Used by the support chat's "check my booking" flow. A booking ID alone is never sufficient (it's not secret) — see the endpoint's docstring. |
+| PATCH  | /api/bookings/&lt;id&gt;/refund-status | Admin-only. `{ "status": "none"\|"requested"\|"processing"\|"refunded"\|"rejected", "amount"?, "notes"? }` — this is the ONLY way refund status ever changes; nothing client-facing sets it. Audit-logged with before/after. |
 
-| Method | Path                     | Notes |
-|--------|--------------------------|-------|
-| POST   | /api/bookings            | Create a booking. Body matches the frontend's booking record shape (`bookingId`, `pnr`, `kind`, `title`, `net`, `platformFee`, `agentFee`, `discount`, `total`, `role`, `traveler`, `details`). |
-| GET    | /api/bookings            | List all, newest first. `?role=agent` filters. |
-| GET    | /api/bookings/&lt;id&gt; | Look up by Tripbookerz Booking ID **or** the airline/hotel partner reference — same dual lookup the admin panel already does. |
+### Callback requests (holiday package lead capture)
+
+The support chat treats holiday package questions as an exception: instead of
+answering from the FAQ bot, it asks for a phone number and captures a real
+callback request — packages are the high-revenue product, so a human
+follow-up converts better than a canned answer.
+
+| Method | Path                                    | Notes |
+|--------|------------------------------------------|-------|
+| POST   | /api/callback-requests                  | Public, rate-limited (5/10min/IP). `{ "phone", "context"? }` |
+| GET    | /api/callback-requests                  | Admin-only. `?status=new` to filter. |
+| PATCH  | /api/callback-requests/&lt;id&gt;/status | Admin-only. `{ "status": "new"\|"contacted"\|"closed" }` |
 
 ### Coupons / Campaigns / Markup config
 

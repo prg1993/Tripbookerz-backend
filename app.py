@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
-from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog
+from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog, CallbackRequest
 
 app = Flask(__name__)
 
@@ -83,10 +83,39 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "onboarding@resend.dev")
 RESEND_HOST = "api.resend.com"
 
+def redact_db_url(url):
+    """For safe logging — never print a connection string with its
+    password in it. postgresql://user:PASSWORD@host/db -> user:***@host/db"""
+    try:
+        if "://" not in url or "@" not in url:
+            return "(unrecognized format)"
+        scheme, rest = url.split("://", 1)
+        creds, hostpart = rest.split("@", 1)
+        user = creds.split(":", 1)[0] if ":" in creds else creds
+        return f"{scheme}://{user}:***@{hostpart}"
+    except Exception:
+        return "(could not parse for logging)"
+
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
 Session = None
 if DATABASE_URL:
-    Session = make_session(DATABASE_URL)
+    try:
+        Session = make_session(DATABASE_URL)
+    except Exception as e:
+        # A bad/unreachable DATABASE_URL must not crash the whole app —
+        # that would take down OTP sending, email, everything, over a
+        # problem that only actually affects DB-backed features. Log
+        # enough to actually debug it (exception type + message, and a
+        # password-redacted version of the URL) without crashing.
+        print(
+            f"ERROR: Could not connect to the database at startup — DB-backed "
+            f"endpoints will return 500s until this is fixed, but the rest of "
+            f"the app (OTP, email) will keep working.\n"
+            f"  URL (redacted): {redact_db_url(DATABASE_URL)}\n"
+            f"  Error: {type(e).__name__}: {e}"
+        )
+        Session = None
 else:
     print(
         "WARNING: DATABASE_URL is not set. Booking/coupon/campaign endpoints "
@@ -349,16 +378,6 @@ def health():
     return jsonify(status="ok")
 
 
-@app.route("/api/admin/diagnostics", methods=["GET"])
-@require_admin_auth
-def admin_diagnostics():
-    return jsonify(
-        database=bool(Session),
-        deploy_env=DEPLOY_ENV,
-        rate_limiter="in-memory (single-instance only)",
-    )
-
-
 def db_required(fn):
     def wrapper(*args, **kwargs):
         if not Session:
@@ -441,6 +460,16 @@ def log_audit(session, action, target=None, details=None):
         action=action, target=target, details=details, ip_address=ip,
     )
     session.add(entry)
+
+
+@app.route("/api/admin/diagnostics", methods=["GET"])
+@require_admin_auth
+def admin_diagnostics():
+    return jsonify(
+        database=bool(Session),
+        deploy_env=DEPLOY_ENV,
+        rate_limiter="in-memory (single-instance only)",
+    )
 
 
 # ---------- Agents: registration, verification, approval, login ----------
@@ -993,6 +1022,150 @@ def get_booking(id_or_ref):
         if not booking:
             return jsonify(error="Not found"), 404
         return jsonify(booking.to_dict())
+    finally:
+        session.close()
+
+
+@app.route("/api/bookings/lookup", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)
+@db_required
+def customer_lookup_booking():
+    """Public self-service lookup for the support chat widget (and any
+    other customer-facing 'track my booking' UI). Deliberately requires
+    BOTH the booking ID and the phone number on that booking to match —
+    a booking ID alone (which could be seen on a screen, shared, or
+    guessed since it's not secret) must not be enough to pull up
+    someone's travel/contact details. This is why this is a separate,
+    stricter endpoint rather than just opening up get_booking() above,
+    which has no such second factor and stays admin-only for that
+    reason."""
+    body = request.get_json(silent=True) or {}
+    booking_id = (body.get("bookingId") or "").strip().upper()
+    phone_digits = "".join(ch for ch in (body.get("phone") or "") if ch.isdigit())
+
+    if not booking_id or not phone_digits:
+        return jsonify(found=False, error="bookingId and phone are required"), 400
+
+    session = Session()
+    try:
+        booking = (
+            session.get(Booking, booking_id)
+            or session.query(Booking).filter(Booking.partner_ref == booking_id).first()
+        )
+        if not booking:
+            return jsonify(found=False, error="No booking found with that ID"), 404
+
+        stored_phone = "".join(ch for ch in (booking.traveler_phone or "") if ch.isdigit())
+        # Compare last 10 digits so a stored "91XXXXXXXXXX" still matches
+        # a customer typing just the 10-digit number, without requiring
+        # them to know exactly how the country code was stored.
+        if not stored_phone or stored_phone[-10:] != phone_digits[-10:]:
+            return jsonify(found=False, error="That booking ID and phone number don't match our records"), 404
+
+        return jsonify(found=True, booking=booking.to_dict())
+    finally:
+        session.close()
+
+
+@app.route("/api/bookings/<booking_id>/refund-status", methods=["PATCH"])
+@require_admin_auth
+@db_required
+def update_refund_status(booking_id):
+    """Admin-only — this is how a refund status becomes real instead of
+    guessed. Nothing client-facing ever sets this; it only reflects what
+    staff have actually recorded after processing (or rejecting) a
+    cancellation."""
+    body = request.get_json(silent=True) or {}
+    new_status = body.get("status")
+    valid_statuses = {"none", "requested", "processing", "refunded", "rejected"}
+    if new_status not in valid_statuses:
+        return jsonify(error=f"status must be one of {sorted(valid_statuses)}"), 400
+
+    session = Session()
+    try:
+        booking = session.get(Booking, booking_id)
+        if not booking:
+            return jsonify(error="Not found"), 404
+        before = booking.refund_status
+        booking.refund_status = new_status
+        booking.refund_updated_at = datetime.utcnow()
+        if new_status == "requested" and not booking.refund_requested_at:
+            booking.refund_requested_at = datetime.utcnow()
+        if "amount" in body:
+            booking.refund_amount = body["amount"]
+        if "notes" in body:
+            booking.refund_notes = body["notes"]
+        log_audit(session, "booking.refund_status_update", target=booking_id,
+                  details={"before": before, "after": new_status})
+        session.commit()
+        return jsonify(success=True, booking=booking.to_dict())
+    finally:
+        session.close()
+
+
+# ---------- Callback requests (holiday package lead capture) ----------
+
+@app.route("/api/callback-requests", methods=["POST"])
+@rate_limit(max_calls=5, window_seconds=600)
+@db_required
+def create_callback_request():
+    """Public — the support chat calls this when someone asks about a
+    holiday package. Deliberately captures a lead for a real staff
+    callback rather than letting the bot try to sell/answer on its own,
+    since packages are called out as the high-revenue product here."""
+    body = request.get_json(silent=True) or {}
+    phone_digits = "".join(ch for ch in (body.get("phone") or "") if ch.isdigit())
+    if len(phone_digits) < 10:
+        return jsonify(success=False, error="A valid phone number is required"), 400
+
+    session = Session()
+    try:
+        req = CallbackRequest(
+            phone=phone_digits,
+            context=(body.get("context") or "")[:500],
+            source=body.get("source", "chat_holiday_package"),
+        )
+        session.add(req)
+        session.commit()
+        return jsonify(success=True, id=req.id), 201
+    finally:
+        session.close()
+
+
+@app.route("/api/callback-requests", methods=["GET"])
+@require_admin_auth
+@db_required
+def list_callback_requests():
+    status_filter = request.args.get("status")
+    session = Session()
+    try:
+        q = session.query(CallbackRequest).order_by(CallbackRequest.created_at.desc())
+        if status_filter:
+            q = q.filter(CallbackRequest.status == status_filter)
+        return jsonify([c.to_dict() for c in q.all()])
+    finally:
+        session.close()
+
+
+@app.route("/api/callback-requests/<int:req_id>/status", methods=["PATCH"])
+@require_admin_auth
+@db_required
+def update_callback_status(req_id):
+    body = request.get_json(silent=True) or {}
+    new_status = body.get("status")
+    if new_status not in {"new", "contacted", "closed"}:
+        return jsonify(error="status must be new, contacted, or closed"), 400
+    session = Session()
+    try:
+        req = session.get(CallbackRequest, req_id)
+        if not req:
+            return jsonify(error="Not found"), 404
+        req.status = new_status
+        if new_status == "contacted" and not req.contacted_at:
+            req.contacted_at = datetime.utcnow()
+        log_audit(session, "callback_request.status_update", target=str(req_id), details={"newStatus": new_status})
+        session.commit()
+        return jsonify(success=True, request=req.to_dict())
     finally:
         session.close()
 

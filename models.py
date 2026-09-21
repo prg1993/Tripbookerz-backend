@@ -46,6 +46,20 @@ class Booking(Base):
     # by kind (flight vs hotel vs package), same as the frontend's `details`.
     details = Column(JSON)
 
+    # Refund/cancellation tracking. Deliberately a lightweight status
+    # field, not the full refund transaction lifecycle (separate Refund
+    # table with supplier/payment-gateway references) — that's a bigger,
+    # separate piece of work. This exists so "check my refund status" can
+    # report something REAL, sourced from what an admin has actually set
+    # after processing a cancellation, rather than never being answerable
+    # or (worse) being guessed/fabricated by anything client-facing.
+    refund_status = Column(String(20), nullable=False, default="none")
+    # none | requested | processing | refunded | rejected
+    refund_amount = Column(Integer)          # set once known/approved
+    refund_requested_at = Column(DateTime)
+    refund_updated_at = Column(DateTime)
+    refund_notes = Column(String(500))       # short admin-facing note, e.g. reason if rejected
+
     def to_dict(self):
         return {
             "bookingId": self.booking_id,
@@ -59,6 +73,11 @@ class Booking(Base):
             "total": self.total,
             "role": self.booked_by_role,
             "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
+            "refundStatus": self.refund_status,
+            "refundAmount": self.refund_amount,
+            "refundRequestedAt": self.refund_requested_at.isoformat() + "Z" if self.refund_requested_at else None,
+            "refundUpdatedAt": self.refund_updated_at.isoformat() + "Z" if self.refund_updated_at else None,
+            "refundNotes": self.refund_notes,
             "traveler": {
                 "name": self.traveler_name,
                 "phone": self.traveler_phone,
@@ -221,6 +240,34 @@ class AuditLog(Base):
             "details": self.details,
             "ip": self.ip_address,
             "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
+        }
+
+
+class CallbackRequest(Base):
+    """Lead capture for high-revenue product interest (currently: holiday
+    packages). Captured by the support chat when someone asks about a
+    package, instead of the bot trying to sell/answer on its own — a
+    real staff callback converts better for a high-value product than
+    a canned chat answer, hence the deliberate exception."""
+    __tablename__ = "callback_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    phone = Column(String(20), nullable=False)
+    context = Column(String(500))          # what they asked about, for the callback agent
+    source = Column(String(50), default="chat_holiday_package")
+    status = Column(String(20), nullable=False, default="new")  # new | contacted | closed
+    created_at = Column(DateTime, default=datetime.utcnow)
+    contacted_at = Column(DateTime)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "phone": self.phone,
+            "context": self.context,
+            "source": self.source,
+            "status": self.status,
+            "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
+            "contactedAt": self.contacted_at.isoformat() + "Z" if self.contacted_at else None,
         }
 
 

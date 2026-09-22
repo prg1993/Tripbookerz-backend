@@ -271,6 +271,69 @@ class CallbackRequest(Base):
         }
 
 
+class BookingAttempt(Base):
+    """Logs EVERY booking journey — not just successful ones. This is
+    deliberately a separate table from Booking (which only ever holds
+    confirmed bookings), because a comprehensive audit/fraud-analysis
+    trail needs to see attempts that never became a booking at all
+    (partner rejected it) and attempts that eventually succeeded only
+    after retries (worth knowing about — repeated persistence failures
+    followed by success is a signal of infrastructure flakiness worth
+    investigating, even though the customer's booking itself is fine).
+
+    A row that ultimately succeeded is linked to its real Booking via
+    final_booking_id — so it naturally shows up in both places: this
+    table (as part of the complete attempts history, including its
+    retry count) and the Booking table (as the actual confirmed
+    booking), joined by that one field. Nothing needs to be duplicated
+    or synced between the two; they're just related by that link."""
+    __tablename__ = "booking_attempts"
+
+    attempt_id = Column(String(32), primary_key=True)  # e.g. TBZATT260922A8XQ2K
+
+    kind = Column(String(20), nullable=False)  # flight | hotel | itinerary
+    title = Column(String(255))
+    net_fare = Column(Integer)
+    role = Column(String(20))  # customer | agent
+
+    traveler_name = Column(String(255))
+    traveler_phone = Column(String(20))
+    traveler_email = Column(String(255))
+    details = Column(JSON)
+
+    partner_outcome = Column(String(20))       # confirmed | rejected
+    persistence_attempts = Column(Integer, default=0)  # how many POST /api/bookings tries this took
+    persistence_outcome = Column(String(20))   # success | error | uncertain | not_attempted
+
+    final_status = Column(String(20), nullable=False)  # succeeded | failed_partner | failed_persistence
+    final_booking_id = Column(String(32))       # set only if final_status == succeeded — links to Booking
+    error_detail = Column(String(500))
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "attemptId": self.attempt_id,
+            "kind": self.kind,
+            "title": self.title,
+            "netFare": self.net_fare,
+            "role": self.role,
+            "traveler": {
+                "name": self.traveler_name,
+                "phone": self.traveler_phone,
+                "email": self.traveler_email,
+            },
+            "details": self.details or {},
+            "partnerOutcome": self.partner_outcome,
+            "persistenceAttempts": self.persistence_attempts,
+            "persistenceOutcome": self.persistence_outcome,
+            "finalStatus": self.final_status,
+            "finalBookingId": self.final_booking_id,
+            "errorDetail": self.error_detail,
+            "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
+        }
+
+
 def make_session(database_url: str):
     """Create the engine + tables (if not already present) and return a session factory."""
     engine = create_engine(database_url, pool_pre_ping=True)

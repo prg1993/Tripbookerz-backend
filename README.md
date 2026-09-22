@@ -185,9 +185,21 @@ requiring payment, confirmed at the time this was built.
    deliverability.
 3. Set `RESEND_API_KEY` and `EMAIL_FROM` as described in `.env.example`.
 
+**Reply-to and CC:** every email sets `Reply-To: support@tripbookerz.com`
+(fixed server-side, never client-controlled — see the route's code
+comments for why). No CC by default. For a holiday-package booking, the
+frontend adds `sales.holiday@tripbookerz.com` to `cc`, plus the assisting
+agent's own email if the booking was agent-assisted — see
+`attemptSendConfirmationEmail()` in `index.html` for that business logic.
+The backend enforces a `@tripbookerz.com` domain allowlist on any
+client-supplied `cc` (max 3 addresses) since this is a public,
+unauthenticated endpoint — this confirms the address is on our own
+domain, not that it's a real, currently-approved employee, which would
+need a DB lookup against an employee directory that doesn't exist yet.
+
 | Method | Path                          | Auth | Notes |
 |--------|-------------------------------|------|-------|
-| POST   | /api/send-confirmation-email  | none, rate-limited | `{ "to", "subject", "html", "pdfFilename"?, "pdfBase64"? }`. Public and rate-limited (10/10min/IP) for the same reason send-otp is — a real customer triggers this right after booking, without being logged in. Cc's support@tripbookerz.com automatically. |
+| POST   | /api/send-confirmation-email  | none, rate-limited | `{ "to", "subject", "html", "pdfFilename"?, "pdfBase64"?, "cc"? }`. Public and rate-limited (10/10min/IP) for the same reason send-otp is — a real customer triggers this right after booking, without being logged in. `cc` is optional, max 3 addresses, each must end in `@tripbookerz.com`. `reply_to` is not accepted from the client at all — always `support@tripbookerz.com`. |
 
 ### Bookings
 
@@ -198,6 +210,21 @@ requiring payment, confirmed at the time this was built.
 | GET    | /api/bookings/&lt;id&gt;          | Admin-only. Look up by Tripbookerz Booking ID **or** the airline/hotel partner reference. |
 | POST   | /api/bookings/lookup              | **Public**, rate-limited. `{ "bookingId", "phone" }` — both must match before anything is returned. Used by the support chat's "check my booking" flow. A booking ID alone is never sufficient (it's not secret) — see the endpoint's docstring. |
 | PATCH  | /api/bookings/&lt;id&gt;/refund-status | Admin-only. `{ "status": "none"\|"requested"\|"processing"\|"refunded"\|"rejected", "amount"?, "notes"? }` — this is the ONLY way refund status ever changes; nothing client-facing sets it. Audit-logged with before/after. |
+
+### Booking attempts (audit trail — every journey, not just successful bookings)
+
+| Method | Path                          | Notes |
+|--------|-------------------------------|-------|
+| POST   | /api/booking-attempts         | **Public**, rate-limited (15/10min/IP — higher than `/api/bookings` itself, since retries within one journey are expected). Called once per booking journey by the frontend, whatever the outcome. `{ "attemptId", "kind", "role", "finalStatus": "succeeded"\|"failed_partner"\|"failed_persistence", "title"?, "netFare"?, "traveler"?, "details"?, "partnerOutcome"?, "persistenceAttempts"?, "persistenceOutcome"?, "finalBookingId"?, "errorDetail"? }` |
+| GET    | /api/booking-attempts         | Admin-only. `?status=failed_partner\|failed_persistence\|succeeded` filters by outcome. `?hadRetries=true` additionally filters to `persistenceAttempts > 1` — specifically for finding "eventually succeeded after retries" journeys, even though those also have `finalStatus=succeeded`. |
+
+A journey that failed then succeeded shows up as ONE row here with
+`finalStatus=succeeded` and `persistenceAttempts` reflecting how many
+tries it took — and, via `finalBookingId`, is also the same booking you'd
+find in the regular `Booking` table. Nothing is duplicated between the
+two tables; they're just related by that one field, so "show me
+everything that had trouble, even if it eventually worked" and "show me
+confirmed bookings" are both answerable without conflicting records.
 
 ### Callback requests (holiday package lead capture)
 

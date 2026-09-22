@@ -38,7 +38,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
-from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog, CallbackRequest
+from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog, CallbackRequest, BookingAttempt
 
 app = Flask(__name__)
 
@@ -82,6 +82,19 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 # (DNS records). Until that's done, Resend only allows sending from its
 # own sandbox address — see .env.example / README for the exact caveat.
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "onboarding@resend.dev")
+
+# Every business email address the backend refers to is configurable —
+# addresses like this can and do change over time (new support inbox,
+# company rebrand, etc.), and hardcoding them means a code change +
+# redeploy for what should be a one-line env var edit.
+SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL", "support@tripbookerz.com")
+# The domain allowed for client-supplied CC addresses (see
+# send_confirmation_email below) is DERIVED from SUPPORT_EMAIL's own
+# domain, not a separate env var — so there's one thing to set, not two
+# that could drift out of sync. If a real case ever needs CC allowed on
+# a different domain than support's own, split this into its own var
+# then; not needed today.
+_CC_ALLOWED_DOMAIN = "@" + SUPPORT_EMAIL.rsplit("@", 1)[-1].lower()
 RESEND_HOST = "api.resend.com"
 
 def redact_db_url(url):
@@ -156,18 +169,30 @@ def msg91_request(method: str, path: str, params: dict):
         return res.status, {"message": raw}
 
 
-def send_email_via_resend(to_email, subject, html_body, attachment_filename=None, attachment_base64=None):
-    """Sends one email via Resend's REST API. Returns (ok: bool, raw response dict)."""
+def resend_send_email(to_email, subject, html_body, attachment_filename=None, attachment_base64=None, cc=None, reply_to=None):
+    """Sends one email via Resend's REST API. Returns (ok: bool, raw response dict).
+    Same (ok, raw) shape as every OTP provider adapter — see the
+    EMAIL_PROVIDER dispatch table below for why that consistency matters.
+
+    cc and reply_to are deliberately caller-supplied, not hardcoded here —
+    WHO gets CC'd is business logic (e.g. "only CC sales.holiday@... for
+    holiday-package bookings, plus the assisting agent's own email if
+    any"), decided by the caller with full context of the booking, not
+    something a generic email-sending adapter should assume for every
+    email it's ever asked to send."""
     if not RESEND_API_KEY:
         return False, {"error": "RESEND_API_KEY not configured on server"}
 
     payload = {
         "from": f"Tripbookerz <{EMAIL_FROM}>",
         "to": [to_email],
-        "cc": ["support@tripbookerz.com"],
         "subject": subject,
         "html": html_body,
     }
+    if cc:
+        payload["cc"] = cc
+    if reply_to:
+        payload["reply_to"] = reply_to
     if attachment_filename and attachment_base64:
         payload["attachments"] = [{"filename": attachment_filename, "content": attachment_base64}]
 
@@ -186,6 +211,35 @@ def send_email_via_resend(to_email, subject, html_body, attachment_filename=None
         data = {"message": raw}
     ok = res.status in (200, 201) and "id" in data
     return ok, data
+
+
+# ---------- Generic email provider dispatch ----------
+# Mirrors the OTP_PROVIDER pattern exactly (see send_otp_via_provider
+# above) so both third-party integrations in this app follow the same
+# shape — one thing to learn, reused twice, rather than two different
+# patterns to remember.
+#
+# TO ADD A NEW EMAIL PROVIDER (e.g. SendGrid, Postmark) LATER:
+#   1. Write one function: your_provider_send_email(to_email, subject,
+#      html_body, attachment_filename=None, attachment_base64=None,
+#      cc=None, reply_to=None) returning (ok: bool, raw_response: dict)
+#      — same shape as resend_send_email above.
+#   2. Add one line to _EMAIL_PROVIDERS below.
+#   3. Set EMAIL_PROVIDER=your_provider_name as an env var.
+# Nothing else in this file changes — every caller uses
+# send_email_via_provider(), never resend_send_email() directly.
+EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER", "resend").lower()
+_EMAIL_PROVIDERS = {
+    "resend": resend_send_email,
+}
+if EMAIL_PROVIDER not in _EMAIL_PROVIDERS:
+    print(f"WARNING: EMAIL_PROVIDER='{EMAIL_PROVIDER}' is not recognized (expected one of: "
+          f"{', '.join(_EMAIL_PROVIDERS.keys())}). Falling back to 'resend'.")
+    EMAIL_PROVIDER = "resend"
+
+
+def send_email_via_provider(to_email, subject, html_body, attachment_filename=None, attachment_base64=None, cc=None, reply_to=None):
+    return _EMAIL_PROVIDERS[EMAIL_PROVIDER](to_email, subject, html_body, attachment_filename, attachment_base64, cc, reply_to)
 
 
 def get_client_ip():
@@ -518,13 +572,45 @@ def send_confirmation_email():
     html_body = body.get("html")
     pdf_filename = body.get("pdfFilename")
     pdf_base64 = body.get("pdfBase64")
+    cc = body.get("cc") or []
 
     if not to_email or not subject or not html_body:
         return jsonify(success=False, error="to, subject, and html are required"), 400
-    if not RESEND_API_KEY:
-        return jsonify(success=False, error="Email sending is not configured on the server"), 500
 
-    ok, data = send_email_via_resend(to_email, subject, html_body, pdf_filename, pdf_base64)
+    # cc is caller-supplied (the frontend knows at send-time whether this
+    # was a holiday-package booking and, if agent-assisted, which agent —
+    # see attemptSendConfirmationEmail() in index.html) — but this is a
+    # PUBLIC, unauthenticated endpoint, so an unrestricted client-supplied
+    # cc list would let anyone use our sending domain/reputation to spam
+    # arbitrary third parties. Enforce a domain allowlist as the actual
+    # security boundary: only addresses on SUPPORT_EMAIL's own domain
+    # (_CC_ALLOWED_DOMAIN, derived above) are accepted.
+    # NOTE, an honest limitation: this confirms the address is on our own
+    # domain, not that it's a real, currently-approved employee/team
+    # address — that would need a DB lookup against a real employee
+    # directory, which doesn't exist yet. Flagged here rather than
+    # silently assumed solved.
+    if not isinstance(cc, list) or len(cc) > 3:
+        return jsonify(success=False, error="cc must be a list of at most 3 addresses"), 400
+    for addr in cc:
+        if not isinstance(addr, str) or not addr.lower().endswith(_CC_ALLOWED_DOMAIN):
+            return jsonify(success=False, error=f"cc address not allowed: {addr}"), 400
+
+    # reply_to is NOT accepted from the request body at all, deliberately
+    # — there's no legitimate case where a caller needs to redirect where
+    # replies go, and allowing it would let a caller silently hijack a
+    # real customer's replies to an address of their choosing. Fixed
+    # server-side to the one value that's ever actually correct.
+    reply_to = SUPPORT_EMAIL
+
+    # No provider-specific config check here deliberately — each provider
+    # adapter already returns a clear (False, {"error": "...not configured..."})
+    # when ITS OWN required config is missing (see resend_send_email above).
+    # A hardcoded "if not RESEND_API_KEY" check here would incorrectly
+    # block a different, properly-configured EMAIL_PROVIDER — exactly the
+    # kind of thing that defeats the point of the abstraction.
+
+    ok, data = send_email_via_provider(to_email, subject, html_body, pdf_filename, pdf_base64, cc, reply_to)
     return jsonify(success=ok, raw=data), (200 if ok else 502)
 
 
@@ -1324,6 +1410,77 @@ def update_callback_status(req_id):
         log_audit(session, "callback_request.status_update", target=str(req_id), details={"newStatus": new_status})
         session.commit()
         return jsonify(success=True, request=req.to_dict())
+    finally:
+        session.close()
+
+
+@app.route("/api/booking-attempts", methods=["POST"])
+@rate_limit(max_calls=15, window_seconds=600)  # a bit higher than bookings itself, since retries within one journey are expected
+@db_required
+def log_booking_attempt():
+    """Public — called once per booking journey, whatever the outcome.
+    This is what makes 'every failed booking is logged, and a booking
+    that failed then succeeded on retry is logged with its attempt
+    count' actually true, rather than just something the fault-tolerant
+    retry logic silently handles client-side. Every field here is a
+    snapshot the FRONTEND already knows by the time it calls this — this
+    endpoint just records it, it doesn't compute anything new."""
+    body = request.get_json(silent=True) or {}
+    required = ["attemptId", "kind", "role", "finalStatus"]
+    missing = [f for f in required if not body.get(f)]
+    if missing:
+        return jsonify(success=False, error=f"Missing fields: {', '.join(missing)}"), 400
+    if body["finalStatus"] not in {"succeeded", "failed_partner", "failed_persistence"}:
+        return jsonify(success=False, error="Invalid finalStatus"), 400
+
+    traveler = body.get("traveler", {})
+    session = Session()
+    try:
+        if session.get(BookingAttempt, body["attemptId"]):
+            return jsonify(success=False, error="attemptId already logged"), 409
+        attempt = BookingAttempt(
+            attempt_id=body["attemptId"],
+            kind=body["kind"],
+            title=body.get("title"),
+            net_fare=body.get("netFare"),
+            role=body["role"],
+            traveler_name=traveler.get("name"),
+            traveler_phone=traveler.get("phone"),
+            traveler_email=traveler.get("email"),
+            details=body.get("details", {}),
+            partner_outcome=body.get("partnerOutcome"),
+            persistence_attempts=body.get("persistenceAttempts", 0),
+            persistence_outcome=body.get("persistenceOutcome"),
+            final_status=body["finalStatus"],
+            final_booking_id=body.get("finalBookingId"),
+            error_detail=(body.get("errorDetail") or "")[:500] or None,
+        )
+        session.add(attempt)
+        session.commit()
+        return jsonify(success=True), 201
+    finally:
+        session.close()
+
+
+@app.route("/api/booking-attempts", methods=["GET"])
+@require_admin_auth
+@db_required
+def list_booking_attempts():
+    """?status=failed_partner|failed_persistence|succeeded to filter.
+    ?hadRetries=true additionally filters to persistenceAttempts > 1 —
+    the 'failed at first but eventually succeeded' view specifically
+    called out as needing its own visibility, even though those rows
+    also have finalStatus=succeeded and a real linked booking."""
+    status_filter = request.args.get("status")
+    had_retries = request.args.get("hadRetries") == "true"
+    session = Session()
+    try:
+        q = session.query(BookingAttempt).order_by(BookingAttempt.created_at.desc())
+        if status_filter:
+            q = q.filter(BookingAttempt.final_status == status_filter)
+        if had_retries:
+            q = q.filter(BookingAttempt.persistence_attempts > 1)
+        return jsonify([a.to_dict() for a in q.limit(500).all()])
     finally:
         session.close()
 

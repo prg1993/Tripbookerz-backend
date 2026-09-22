@@ -285,6 +285,23 @@ VM behind Gunicorn + nginx, etc. Set `MSG91_AUTH_KEY`, `MSG91_TEMPLATE_ID`,
 and `DATABASE_URL` as environment variables in that platform's dashboard
 — don't bake them into the deployed code or a committed `.env` file.
 
+**Pin the Python version on Render — set `PYTHON_VERSION=3.12.7`** as an
+environment variable (Render's dashboard, not a `runtime.txt` file —
+evidence from Render's own support forum suggests `runtime.txt` isn't
+reliably honored there currently; `PYTHON_VERSION` is their confirmed
+working mechanism). This isn't precautionary — it's fixing a real
+incident: `requirements.txt` had `psycopg2-binary==2.9.9` pinned, which
+predates Python 3.13/3.14 support entirely (that arrived in 2.9.10 and
+2.9.11 respectively). Render silently updated its default Python to
+3.14 at some point, and the old psycopg2-binary wheel's compiled ABI no
+longer matched, breaking the database connection with an `ImportError:
+undefined symbol: _PyInterpreterState_Get` — a well-documented CPython
+3.13+ rename, not specific to this app. Now fixed both ways: the
+dependency is current (`psycopg2-binary==2.9.12`), AND the Python
+version is pinned so Render can't silently jump to a newer version
+again and reintroduce the same class of break with some other
+compiled dependency later.
+
 Restrict CORS (`CORS(app, origins=[...])` in `app.py`) to your real
 frontend domain before going live; `CORS(app)` (allow-all) is fine for
 local testing only.

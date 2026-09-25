@@ -38,7 +38,8 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
-from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog, CallbackRequest, BookingAttempt
+from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog, CallbackRequest, BookingAttempt, FlightProviderLog
+import flight_providers
 
 app = Flask(__name__)
 
@@ -241,6 +242,109 @@ if EMAIL_PROVIDER not in _EMAIL_PROVIDERS:
 def send_email_via_provider(to_email, subject, html_body, attachment_filename=None, attachment_base64=None, cc=None, reply_to=None):
     return _EMAIL_PROVIDERS[EMAIL_PROVIDER](to_email, subject, html_body, attachment_filename, attachment_base64, cc, reply_to)
 
+
+# ---------- Generic payment provider dispatch ----------
+# Mirrors OTP_PROVIDER / EMAIL_PROVIDER exactly — same reasoning: one
+# thing to learn, reused a third time, rather than a new pattern.
+#
+# HONEST STATE TODAY: the only implementation is mock_process_payment
+# below. It does NOT charge anything real, and the reference number it
+# returns is NOT issued by any real payment gateway — "PAYMENT_PROVIDER"
+# defaults to "mock" and there is no other option implemented yet. This
+# exists so the REST of the system (this endpoint, the database schema,
+# the invoice, traceability) is already built against the real shape a
+# genuine gateway integration will have. Swapping in a real one (Razorpay,
+# Stripe, PayU) later means:
+#   1. Sign up with that provider and get real API credentials — this
+#      needs a real merchant account, which is outside what can be set
+#      up from here.
+#   2. Write one function: your_provider_process_payment(amount,
+#      currency, method) returning (ok: bool, reference: str, raw: dict)
+#      — same shape as mock_process_payment below.
+#   3. Add one line to _PAYMENT_PROVIDERS below.
+#   4. Set PAYMENT_PROVIDER=your_provider_name and that provider's
+#      credentials as env vars.
+# Nothing else in this file, or the frontend, needs to change — every
+# caller uses process_payment_via_provider(), never a specific
+# provider's function directly.
+def mock_process_payment(amount, currency, method):
+    """Returns (success: bool, reference: str, raw: dict). Simulates an
+    immediate successful charge for a given amount/method. NOT a real
+    payment gateway — see the module-level comment above."""
+    reference = "MOCK_PAY_" + datetime.utcnow().strftime("%y%m%d") + "_" + secrets.token_hex(6).upper()
+    return True, reference, {
+        "amount": amount, "currency": currency, "method": method,
+        "simulated": True, "note": "No real payment gateway is integrated yet.",
+    }
+
+PAYMENT_PROVIDER = os.environ.get("PAYMENT_PROVIDER", "mock").lower()
+_PAYMENT_PROVIDERS = {
+    "mock": mock_process_payment,
+}
+# Which registered providers are mocks (silently "succeed" with fake
+# data) vs real (actually call a real gateway). Kept right next to the
+# registry itself so adding a real provider later means flipping its
+# entry to False in the SAME edit that adds it — not a separate,
+# easy-to-forget step. See enforce_no_mock_providers_in_production()
+# below for what this is actually used for.
+_PAYMENT_PROVIDERS_IS_MOCK = {
+    "mock": True,
+}
+if PAYMENT_PROVIDER not in _PAYMENT_PROVIDERS:
+    print(f"WARNING: PAYMENT_PROVIDER='{PAYMENT_PROVIDER}' is not recognized (expected one of: "
+          f"{', '.join(_PAYMENT_PROVIDERS.keys())}). Falling back to 'mock'.")
+    PAYMENT_PROVIDER = "mock"
+
+
+def process_payment_via_provider(amount, currency, method):
+    return _PAYMENT_PROVIDERS[PAYMENT_PROVIDER](amount, currency, method)
+
+
+# ---------- Production safety net: refuse to silently serve fake data ----------
+# Same principle as the CORS_ORIGINS check above, generalized: a
+# misconfigured or forgotten env var should be a loud failure at
+# startup, not a silent one discovered later from a customer complaint
+# or a finance reconciliation mismatch. This specifically targets
+# providers that SUCCEED with fake data rather than erroring — OTP and
+# email providers already fail loudly if unconfigured (a missing API
+# key means a real error, not a fake success), so they don't need this;
+# payment and flight fares are the two that currently CAN silently
+# fake success, so those are the two checked today.
+#
+# TO COVER A NEW MODULE LATER (e.g. a real hotel-provider aggregator
+# gets built the same way flights was): add one entry to
+# MOCK_PROVIDER_CHECKS below — (label, active provider name(s) as a
+# list, that category's is-mock dict). Nothing else about this function
+# needs to change.
+MOCK_PROVIDER_CHECKS = [
+    ("PAYMENT_PROVIDER", [PAYMENT_PROVIDER], _PAYMENT_PROVIDERS_IS_MOCK),
+    ("FLIGHT_PROVIDERS_ENABLED", flight_providers.FLIGHT_PROVIDERS_ENABLED, flight_providers.FLIGHT_PROVIDERS_IS_MOCK),
+]
+
+
+def enforce_no_mock_providers_in_production():
+    if DEPLOY_ENV != "production":
+        return
+    problems = []
+    for env_var_name, active_providers, is_mock_map in MOCK_PROVIDER_CHECKS:
+        mock_active = [p for p in active_providers if is_mock_map.get(p, False)]
+        if mock_active:
+            problems.append(f"{env_var_name} has mock provider(s) active: {', '.join(mock_active)}")
+    if problems:
+        raise SystemExit(
+            "REFUSING TO START: DEPLOY_ENV=production but the following "
+            "would silently serve simulated/fake data to real customers:\n  - "
+            + "\n  - ".join(problems)
+            + "\nThis is deliberate — a mock succeeding silently (rather than "
+              "erroring) is exactly the kind of misconfiguration that's easy "
+              "to miss until a customer or a finance reconciliation catches "
+              "it. Set these to real, non-mock provider names before "
+              "deploying to production, or unset DEPLOY_ENV=production if "
+              "this is intentionally a staging-like environment."
+        )
+
+
+enforce_no_mock_providers_in_production()
 
 def get_client_ip():
     """Returns the real client IP, trusting only the hop closest to this
@@ -522,6 +626,31 @@ _OTP_RESEND_PROVIDERS = {
 
 def resend_otp_via_provider(mobile, retry_type):
     return _OTP_RESEND_PROVIDERS[OTP_PROVIDER](mobile, retry_type)
+
+
+@app.route("/api/payments/process", methods=["POST"])
+@rate_limit(max_calls=10, window_seconds=600)  # 10 per 10 min per IP
+def process_payment():
+    """Public and rate-limited for the same reason send-otp is: a real
+    customer triggers this right at checkout, without necessarily being
+    logged in. Payment processing is server-authoritative, never trusted
+    from the client — this endpoint exists specifically so the reference
+    number and success/failure are DECIDED HERE, not just relayed from
+    whatever the browser claims happened. See the PAYMENT_PROVIDER
+    dispatch above for the honest current state (mock only, no real
+    gateway integrated yet)."""
+    body = request.get_json(silent=True) or {}
+    amount = body.get("amount")
+    currency = body.get("currency", "INR")
+    method = body.get("method")
+
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        return jsonify(success=False, error="A valid positive amount is required"), 400
+    if method not in {"Credit/Debit Card", "UPI", "Net Banking"}:
+        return jsonify(success=False, error="Invalid payment method"), 400
+
+    ok, reference, raw = process_payment_via_provider(amount, currency, method)
+    return jsonify(success=ok, referenceNo=reference, raw=raw), (200 if ok else 402)
 
 
 @app.route("/api/send-otp", methods=["POST"])
@@ -1131,6 +1260,68 @@ def get_audit_log():
         session.close()
 
 
+# ---------- Flight search (multi-provider aggregation) ----------
+# Actual provider logic lives entirely in flight_providers.py — this
+# route is deliberately thin: parse the request, call the aggregator,
+# persist the provider-performance log, return the results. Nothing
+# provider-specific belongs here; that's the whole point of the module
+# split.
+
+@app.route("/api/flights/search", methods=["POST"])
+@rate_limit(max_calls=20, window_seconds=600)  # 20 per 10 min per IP — searching is cheap and frequent, higher limit than booking-mutation endpoints
+def search_flights():
+    body = request.get_json(silent=True) or {}
+    from_code = (body.get("from") or "").strip().upper()
+    to_code = (body.get("to") or "").strip().upper()
+    date = (body.get("date") or "").strip()
+    if not from_code or not to_code or not date:
+        return jsonify(success=False, error="from, to, and date are all required"), 400
+    if from_code == to_code:
+        return jsonify(success=False, error="from and to cannot be the same"), 400
+
+    results, provider_log = flight_providers.search_flights_aggregated(from_code, to_code, date)
+
+    search_id = "SRCH" + secrets.token_hex(8).upper()
+    if Session:
+        session = Session()
+        try:
+            for entry in provider_log:
+                session.add(FlightProviderLog(
+                    search_id=search_id, from_code=from_code, to_code=to_code, search_date=date,
+                    provider=entry["provider"], responded=entry["responded"], error=entry["error"],
+                    offer_count=entry["offerCount"], lowest_fare=entry["lowestFare"], won_any_offer=entry["wonAnyOffer"],
+                ))
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            # A logging failure must never block real search results
+            # from reaching the customer — log it server-side and move on.
+            print(f"WARNING: failed to persist FlightProviderLog for {search_id}: {e}")
+        finally:
+            session.close()
+    else:
+        print(f"WARNING: DATABASE_URL not configured — FlightProviderLog for {search_id} was not persisted, but search results are still returned.")
+
+    return jsonify(success=True, searchId=search_id, results=results)
+
+
+@app.route("/api/flights/reprice", methods=["POST"])
+@rate_limit(max_calls=20, window_seconds=600)
+def reprice_flight():
+    """THE GUARDRAIL, called right before payment. See reprice_offer()'s
+    own docstring in flight_providers.py for the full contract — this
+    route is just a thin wrapper that turns its result into HTTP."""
+    body = request.get_json(silent=True) or {}
+    token = body.get("offerToken")
+    if not token:
+        return jsonify(success=False, error="offerToken is required"), 400
+
+    result = flight_providers.reprice_offer(token)
+    if not result["ok"]:
+        return jsonify(success=False, error=result["error"]), 409
+    return jsonify(success=True, **{k: v for k, v in result.items() if k != "ok"})
+
+
 # ---------- Bookings ----------
 
 @app.route("/api/bookings", methods=["POST"])
@@ -1229,6 +1420,18 @@ def create_booking():
             # fact would silently mislabel unverified data as verified.
             traveler_phone_verified=False,
             traveler_email=traveler.get("email"),
+            # Accepted from the client for now, same documented trust
+            # boundary as `net` above: the reference itself IS genuinely
+            # server-generated (by /api/payments/process, called earlier
+            # in the checkout flow — see PAYMENT_PROVIDER), but nothing
+            # here re-verifies that THIS specific request actually came
+            # from a real prior call to that endpoint before storing it.
+            # Closing that gap needs a payments ledger (issued references
+            # tracked and checked here), which is a larger addition than
+            # this pass — same category of "known, not silently accepted"
+            # gap as the unverified `net` fare.
+            payment_mode=body.get("paymentMode"),
+            payment_reference=body.get("paymentReference"),
             details=body.get("details", {}),
         )
         session.add(booking)
@@ -1481,6 +1684,26 @@ def list_booking_attempts():
         if had_retries:
             q = q.filter(BookingAttempt.persistence_attempts > 1)
         return jsonify([a.to_dict() for a in q.limit(500).all()])
+    finally:
+        session.close()
+
+
+@app.route("/api/admin/flight-provider-logs", methods=["GET"])
+@require_admin_auth
+@db_required
+def list_flight_provider_logs():
+    """?provider=tbo to filter to one provider's history (the actual
+    'evaluate this provider' view) — aggregate stats (response rate,
+    win rate) are left to whoever's doing the evaluating to compute
+    from these rows rather than baked into this endpoint, since the
+    useful time window/grouping for that isn't fixed yet."""
+    provider_filter = request.args.get("provider")
+    session = Session()
+    try:
+        q = session.query(FlightProviderLog).order_by(FlightProviderLog.created_at.desc())
+        if provider_filter:
+            q = q.filter(FlightProviderLog.provider == provider_filter)
+        return jsonify([e.to_dict() for e in q.limit(1000).all()])
     finally:
         session.close()
 

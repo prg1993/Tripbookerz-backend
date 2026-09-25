@@ -165,6 +165,62 @@ curl -X POST https://your-backend.onrender.com/api/admin/users \
 ```
 
 
+### Flight search (multi-provider aggregation)
+
+**Not real providers yet.** All logic lives in `flight_providers.py` —
+deliberately its own file, not more code in `app.py`, so it's genuinely
+plug-and-play: add a real provider by writing one function matching the
+existing shape, adding one line to a registry dict, and setting an env
+var — nothing else changes.
+
+Six providers are mocked today (all six actually named in the
+integration guide this was built from, not invented): **Duffel,
+Mystifly, Travelfusion, TBO Holidays, Amadeus Self-Service, Kiwi
+(Tequila API)**. All are queried **in parallel** (not sequentially) with
+a timeout (`FLIGHT_PROVIDER_TIMEOUT_SECONDS`, default 4s) — a slow or
+unresponsive provider doesn't block the ones that answered on time.
+Results are deduplicated by `[airline + flightNo + depTime]`, keeping
+the cheapest offer per flight and recording which provider "won" it.
+
+**The re-price guardrail** (`POST /api/flights/reprice`) exists so a
+price hike never silently lands on the customer or the company: every
+search result carries an HMAC-signed `offerToken` (so a client can't
+tamper with which provider/price a booking would route to), and the
+frontend MUST call `/api/flights/reprice` with that token right before
+payment. Three possible outcomes: price unchanged (safe to charge),
+price changed — up OR down — (a NEW token is issued; the caller must
+get explicit customer re-confirmation before proceeding), or the fare
+is no longer available at all (booking blocked, search again).
+
+**Every provider's performance on every search is logged** (`GET
+/api/admin/flight-provider-logs`, admin-only — see whether it responded,
+how many offers, its lowest fare, and whether it ever actually won the
+lowest price) specifically so "evaluate the providers later and keep
+the good ones" is an answerable question with real data behind it, not
+just a hope.
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| POST | /api/flights/search | none, rate-limited | `{ "from", "to", "date" }` → `{ "success", "searchId", "results": [...] }`. 20/10min/IP. |
+| POST | /api/flights/reprice | none, rate-limited | `{ "offerToken" }` → see the guardrail description above. 20/10min/IP. |
+
+### Payments
+
+**Not a real payment gateway.** `POST /api/payments/process` exists so
+payment processing is server-authoritative (never trusted from the
+client — same principle as fare calculation), but the only implemented
+provider is `mock`, which simulates an immediate successful charge and
+returns a realistic-looking reference number (`MOCK_PAY_YYMMDD_HEX`).
+Follows the exact same swappable-provider pattern as OTP/email — see
+`PAYMENT_PROVIDER` in `.env.example` and the comment above it in
+`app.py`. Integrating a real gateway (Razorpay, Stripe, PayU) requires
+a real merchant account and its own webhook-verification flow — that's
+real, separate work, not something this mock stands in for.
+
+| Method | Path                    | Auth | Notes |
+|--------|-------------------------|------|-------|
+| POST   | /api/payments/process   | none, rate-limited | `{ "amount", "currency"?, "method": "Credit/Debit Card"\|"UPI"\|"Net Banking" }` → `{ "success", "referenceNo", "raw" }`. Public and rate-limited (10/10min/IP) — called right at checkout, before the customer is necessarily logged in. |
+
 ### Confirmation emails (Resend)
 
 **This replaces the previous fully-simulated email.** Booking confirmations
@@ -335,6 +391,20 @@ local testing only.
 
 ## 7. Security guardrails — what's actually in place vs. not
 
+**Production refuses to start if any active provider is still a mock.**
+Same principle as the existing `CORS_ORIGINS` production check, extended
+to cover `PAYMENT_PROVIDER` and `FLIGHT_PROVIDERS_ENABLED` — with
+`DEPLOY_ENV=production`, if either one still points at a mock
+implementation, the app raises `SystemExit` at startup with a clear list
+of exactly what needs fixing, rather than silently serving simulated
+fares or fake payment success to real customers. OTP and email
+providers aren't included in this check because they already fail
+loudly (a missing API key errors, it doesn't silently succeed) — this
+specifically targets providers that CAN succeed with fake data. See
+`enforce_no_mock_providers_in_production()` in `app.py`; adding a new
+category later (e.g. a future real hotel-provider aggregator) is one
+line in `MOCK_PROVIDER_CHECKS`, not a new mechanism.
+
 **Fixed in this version:**
 - **Admin authentication.** Endpoints that expose traveler PII or control pricing/promotions (booking lookup/list, coupon create/list/delete, campaign create/toggle, changing markup config) now require an `X-Admin-Key` header matching `ADMIN_API_KEY`. This is a **shared-secret stopgap for pre-prod**, not real multi-user auth — it can't tell one admin/agent apart from another, and the key must be rotated manually if it ever leaks. Replace with real per-user accounts + roles before this handles real staff with different permission levels.
 - **Server-side fare trust boundary.** `POST /api/bookings` no longer accepts `platformFee`, `discount`, or `total` from the client as truth — it recomputes `platformFee` from the server's own `MarkupConfig` row, recomputes `discount` from the actual `Coupon` row (if a `couponCode` is passed), and always recalculates `total` itself. A modified frontend can no longer just declare its own price.
@@ -344,6 +414,8 @@ local testing only.
 - **`net` (the airline/hotel fare) is still accepted from the client.** This backend has no live GDS/hotel feed of its own to verify it against yet — that's a larger, separate integration, not a quick fix here.
 - **No audit history.** Changing `MarkupConfig` overwrites the single row with no record of the previous value, who changed it, or when. Same for coupon/campaign edits. If "who changed the markup and when" needs to be answerable later, this needs an append-only audit log table, not yet built.
 - **agentFee is still client-supplied**, since it's a legitimate per-booking discretionary value an agent sets — but nothing here bounds it (e.g. a max % cap), so an agent-facing client could currently submit an unreasonable fee.
+- **`paymentReference` is accepted from the client at booking-creation time without re-verification.** The reference itself IS genuinely server-generated (by `/api/payments/process`), but `create_booking` doesn't yet check that a given reference actually came from a real prior call to that endpoint before storing it. Closing this needs a payments ledger (issued references tracked and checked here) — see the comment above `payment_reference` in `models.py` for the full note.
+- **No real payment gateway.** `PAYMENT_PROVIDER` defaults to (and only has) `mock` — see its own section above for what integrating a real one requires.
 
 **CORS — now environment-conditional, not a manual-edit comment:**
 Previously this was `CORS(app)` (allow-all) with a comment saying "restrict this before going live" — exactly the kind of thing that's easy to forget. It's now driven by the same `DEPLOY_ENV` variable as the rate-limiter gate: staging defaults to allow-all (convenient for testing from anywhere), but `DEPLOY_ENV=production` makes `CORS_ORIGINS` mandatory and **refuses to start** without it. Set `CORS_ORIGINS` in staging too, any time you want to test the restricted behavior early.

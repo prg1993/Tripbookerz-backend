@@ -42,6 +42,17 @@ class Booking(Base):
     traveler_phone_verified = Column(Boolean, default=False)
     traveler_email = Column(String(255))
 
+    # Dedicated, indexed columns — not buried in the `details` JSON blob
+    # below — specifically because real audit/finance reconciliation
+    # needs to search/filter by payment reference efficiently ("find the
+    # booking matching payment ref X" against the gateway's own records),
+    # which a JSON field can't do well. See PAYMENT_PROVIDER in app.py
+    # for the honest current state: mock only, no real gateway yet — this
+    # column holds whatever reference that mock (or, later, a real
+    # gateway) actually returned, never a client-supplied guess.
+    payment_mode = Column(String(30))
+    payment_reference = Column(String(64), index=True)
+
     # Route/stay/itinerary specifics — kept as JSON since the shape differs
     # by kind (flight vs hotel vs package), same as the frontend's `details`.
     details = Column(JSON)
@@ -73,6 +84,8 @@ class Booking(Base):
             "total": self.total,
             "role": self.booked_by_role,
             "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
+            "paymentMode": self.payment_mode,
+            "paymentReference": self.payment_reference,
             "refundStatus": self.refund_status,
             "refundAmount": self.refund_amount,
             "refundRequestedAt": self.refund_requested_at.isoformat() + "Z" if self.refund_requested_at else None,
@@ -239,6 +252,45 @@ class AuditLog(Base):
             "target": self.target,
             "details": self.details,
             "ip": self.ip_address,
+            "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
+        }
+
+
+class FlightProviderLog(Base):
+    """One row per provider per search — this is what makes 'evaluate
+    the providers later and decide which to keep' an answerable question
+    instead of just a hope. Without this, there'd be no data to actually
+    compare providers against: how often each one responds in time, how
+    fast, whether it ever actually offers the winning (cheapest) price,
+    or just adds latency and noise to every search.
+
+    Deliberately NOT linked to a specific Booking — most searches never
+    become a booking at all, and provider evaluation needs the FULL
+    search volume (including ones nobody booked), not just the sliver
+    that converted."""
+    __tablename__ = "flight_provider_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    search_id = Column(String(40), index=True, nullable=False)  # groups all providers' rows for one search
+    from_code = Column(String(10))
+    to_code = Column(String(10))
+    search_date = Column(String(10))  # the travel date searched for (YYYY-MM-DD), not this row's created_at
+
+    provider = Column(String(30), index=True, nullable=False)
+    responded = Column(Boolean, nullable=False)
+    error = Column(String(255))
+    offer_count = Column(Integer, default=0)
+    lowest_fare = Column(Integer)
+    won_any_offer = Column(Boolean, default=False)  # did this provider have the cheapest price for ANY deduplicated result
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "searchId": self.search_id,
+            "fromCode": self.from_code, "toCode": self.to_code, "searchDate": self.search_date,
+            "provider": self.provider, "responded": self.responded, "error": self.error,
+            "offerCount": self.offer_count, "lowestFare": self.lowest_fare, "wonAnyOffer": self.won_any_offer,
             "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
         }
 

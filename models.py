@@ -8,7 +8,7 @@ shared, durable version of that same data.
 
 from datetime import datetime
 from sqlalchemy import (
-    create_engine, Column, String, Integer, Float, Boolean, DateTime, JSON
+    create_engine, Column, String, Integer, Float, Boolean, DateTime, JSON, inspect, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -386,8 +386,84 @@ class BookingAttempt(Base):
         }
 
 
+def ensure_schema_up_to_date(engine):
+    """THE FIX for 'column bookings.payment_mode does not exist' on the
+    live database, and — more importantly — for the whole CLASS of bug
+    that caused it: Base.metadata.create_all() below only creates
+    tables that don't exist yet. It does NOT add new columns to a table
+    that already exists. Since 'bookings' already existed in the live
+    database from before payment_mode/payment_reference were added to
+    this model, every deploy since then silently did nothing for that
+    table — the code and the live schema quietly drifted apart, and
+    every booking attempt failed with exactly this error.
+
+    This project has no Alembic (a known, previously-flagged gap — see
+    the backend README). Rather than requiring a manual ALTER TABLE
+    every time a column gets added to an existing table (easy to
+    forget, exactly what happened here), this runs automatically on
+    every startup and closes the gap itself.
+
+    DELIBERATELY CONSERVATIVE, because this runs against a real,
+    already-populated database: it only ever ADDS a column or index
+    that's missing. It never drops, renames, or alters an existing
+    one, and it never adds a NOT NULL constraint (even if the model
+    declares one) — Postgres can't retroactively invent a value for
+    rows that already exist, and forcing that constraint here would
+    make the ALTER itself fail outright rather than heal the schema.
+    A column that genuinely needs to be NOT NULL on a live table needs
+    a real, deliberate migration with a backfill plan, not this.
+
+    Idempotent — safe to run on every single startup, not just once.
+    Postgres's own IF NOT EXISTS handles "nothing to do" atomically,
+    rather than this code trying to diff schemas itself and risking a
+    bug in that diffing logic on a real database.
+
+    Each statement runs in its OWN short-lived transaction, deliberately
+    — not one shared transaction for the whole function. In Postgres, a
+    single failed statement aborts the ENTIRE transaction it's part of,
+    and every subsequent statement in that same transaction then fails
+    too, even perfectly valid ones — a per-statement try/except alone
+    doesn't protect against that if they all share one connection/
+    transaction. Isolating each statement means one unusual column type
+    this code doesn't handle well can only ever block that one column,
+    never silently take out every other column/table this function was
+    also supposed to fix in the same run."""
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    columns_added = 0
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue  # a genuinely new table — create_all() already handles this case correctly
+        for column in table.columns:
+            col_type = column.type.compile(dialect=engine.dialect)
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        f'ALTER TABLE "{table.name}" ADD COLUMN IF NOT EXISTS "{column.name}" {col_type}'
+                    ))
+            except Exception as e:
+                print(f"WARNING: could not ensure column {table.name}.{column.name} exists: {e}")
+                continue
+            columns_added += 1
+            if column.index and not column.primary_key:
+                # Mirrors SQLAlchemy's own default index-naming
+                # convention (ix_<table>_<column>) so this doesn't
+                # create a second, differently-named duplicate index
+                # alongside one create_all() may have already made.
+                index_name = f"ix_{table.name}_{column.name}"
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text(
+                            f'CREATE INDEX IF NOT EXISTS "{index_name}" ON "{table.name}" ("{column.name}")'
+                        ))
+                except Exception as e:
+                    print(f"WARNING: could not ensure index {index_name} exists: {e}")
+    print(f"SCHEMA: checked {len(existing_tables)} existing table(s), verified/added {columns_added} column(s) across all of them")
+
+
 def make_session(database_url: str):
     """Create the engine + tables (if not already present) and return a session factory."""
     engine = create_engine(database_url, pool_pre_ping=True)
     Base.metadata.create_all(engine)
+    ensure_schema_up_to_date(engine)
     return sessionmaker(bind=engine)

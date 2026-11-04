@@ -204,6 +204,129 @@ just a hope.
 | POST | /api/flights/search | none, rate-limited | `{ "from", "to", "date" }` → `{ "success", "searchId", "results": [...] }`. 20/10min/IP. |
 | POST | /api/flights/reprice | none, rate-limited | `{ "offerToken" }` → see the guardrail description above. 20/10min/IP. |
 
+### Cab/transfer search (multi-supplier aggregation)
+
+Same architecture as flight search, built from a separate integration
+spec (cab-specific: multi-supplier aggregation, landed-cost
+normalization, category upgrades, driver dispatch). All logic lives in
+`cab_providers.py` — plug-and-play the same way flights are: a real
+supplier is one function + one registry line + one env var, nothing
+else changes.
+
+**Three suppliers mocked today** (all three actually named in that
+spec, not invented): **Savaari, TBO Transfers, Goibibo/Local**. Queried
+in parallel with a 1,800ms timeout (`CAB_SUPPLIER_TIMEOUT_SECONDS`) —
+tighter than flights' 4s, per that spec.
+
+**Landed Cost, not raw fare, is what gets compared** — suppliers quote
+with different inclusion policies (tolls, driver night allowances,
+commission), so raw base fares aren't comparable. Every quote is
+normalized to `Base Fare + Driver Allowance + Tolls/Permits + GST(5%) −
+Commission/Cashback` before anything gets compared. This formula was
+verified **byte-exact** against a worked example in the source spec
+itself (Savaari SUV: ₹1800 base + ₹250 tolls → GST ₹102.50, total
+₹2152.50) before being trusted, not just implemented from the prose
+description.
+
+**Selection isn't purely cheapest-wins.** If a higher-reliability
+supplier (`SUPPLIER_RELIABILITY` — Savaari 98%, TBO 91%, Goibibo/Local
+82%, none of these measured from anything real yet) is within 4% of the
+cheapest landed cost, the system routes there instead, to reduce
+driver no-shows — the source spec's own SLA override rule.
+
+**Vehicle taxonomy**: Sedan (3 pax/2 bags), SUV (6 pax/4 bags), and
+Tempo Traveller (12 pax/10 bags) — the last one added here, since the
+source spec's own taxonomy stops at SUV and gives no guidance for
+larger groups. **Capacity is a hard floor**: a category that can't
+physically fit the requested passenger count is never offered as an
+option at all (verified against the spec's own explicit example — 5
+passengers cannot select Sedan). A luggage-driven upgrade is
+*suggested*, never forced, matching the spec's own example (2
+passengers with >2 large bags get a suggested SUV upgrade).
+
+**No Redis — a deliberate substitution, not an oversight.** The source
+spec calls for caching the fallback supplier in Redis for instant
+failover. This deployment has no Redis and doesn't need one: the
+routed supplier AND its pre-computed fallback are both encoded together
+in the same kind of HMAC-signed offer token flights already use (see
+`offer_tokens.py`, now shared between both). If the routed supplier's
+quote falls through at requote time, the system automatically falls
+back to the one already encoded in the token — verified with a forced
+test (routed supplier made to fail, confirmed the system correctly
+substitutes the fallback rather than failing the booking outright).
+
+Every supplier's performance on every search is logged
+(`CabProviderLog`, viewable via `GET /api/admin/cab-provider-logs`) —
+same reasoning as flights: this is what makes "evaluate suppliers
+later" answerable from real data, including a dimension flights don't
+have (`wonOnReliability` — did a supplier win by being cheapest, or by
+being routed to *despite* not being cheapest, via the reliability
+override).
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| POST | /api/cabs/search | none, rate-limited | `{ "pickup", "drop", "pickupDatetime", "passengers", "luggageCount"?, "category"? }` → quotes grouped by category, each with a signed `cabOfferToken`. 20/10min/IP. |
+| POST | /api/cabs/requote | none, rate-limited | `{ "cabOfferToken" }` → the guardrail, called right before payment. Re-checks the routed supplier's price; falls back automatically if that supplier's quote is no longer available. 20/10min/IP. |
+| GET | /api/admin/cab-provider-logs | admin | `?supplier=savaari` to filter to one supplier's history. |
+
+### Cab dispatch notifications (Phase 2)
+
+Driver assignment and notification, for cab transfers booked as part
+of a holiday package. All logic lives in `cab_dispatch.py`.
+
+**The webhook is signature-verified** (`X-Webhook-Signature` header,
+HMAC over the raw request body, `CAB_DISPATCH_WEBHOOK_SECRET`) —
+without this, anyone who found the URL could POST fake driver-
+assignment data against any booking reference they guess or
+enumerate. Checked unconditionally first, before anything else
+(including whether the database happens to be configured) — an
+unauthenticated request should never get to learn anything about
+backend state before being rejected for lacking a valid signature.
+
+**No real cab supplier exists to ever call the real webhook** — `POST
+/api/admin/cab-dispatch/simulate` exercises the exact same processing
+path (`process_dispatch_event`, shared by both) so the whole pipeline
+is genuinely provable end-to-end without one.
+
+**Notifications fire on two channels in parallel** (WhatsApp, mocked —
+no real Business API account exists yet — and email, via the already-
+real Resend integration), not a fallback-only-if-the-first-fails
+chain, matching the source spec's own diagram (a fork that converges
+back together, not a conditional branch).
+
+**The T-90-minute safety net** (`POST /api/admin/cab-dispatch/safety-
+net-check`) is NOT an in-process scheduler — Flask under Gunicorn isn't
+a place to run one (workers recycle). It's an admin-protected endpoint
+meant to be triggered externally on a schedule (a Render Cron Job or
+similar) every ~15 minutes, per the source spec. For every dispatch
+with a pickup in the next 60-90 minutes and still no driver, it polls
+the (mocked) supplier; resolves through the same processing path if a
+driver turns up, or marks it `escalated_to_ops` and logs an alert if
+not — stated plainly: that's a log line today, not a real paging/
+ticketing integration, since no real ops system exists to page.
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| POST | /webhooks/cab-dispatch | signature only | The real webhook. `{ "booking_ref", "event_type", "driver", "vehicle", "live_tracking_url" }`. |
+| POST | /api/admin/cab-dispatch/simulate | admin | `{ "bookingId", "category"? }` — fabricates a realistic dispatch event and runs it through the real processing path. |
+| POST | /api/admin/cab-dispatch/safety-net-check | admin | Meant to be called by an external cron, not a person — returns `{ "checked", "resolved", "escalated" }`. |
+| GET | /api/admin/cab-dispatch | admin | `?bookingId=...` to filter to one booking. |
+
+**HONEST TESTING LIMITATION**: the safety-net route's own database
+query (a date-range comparison plus a null check) needs real SQLAlchemy
+comparison-operator behavior this sandbox's minimal test stub doesn't
+simulate — same boundary hit before elsewhere in this project. The
+actual checking LOGIC (poll, resolve-or-escalate, count) is factored
+into its own function specifically so it could be tested independently
+of that query, and was — the query construction itself is the one
+piece whose first real test will be an actual deployment with a real
+database.
+
+**Still not built**: no real cab supplier exists to genuinely call the
+webhook — Phase 2 proves the pipeline works, it doesn't create a real
+integration. The external cron trigger for the safety-net check is
+also not something committable — that's a Render dashboard step.
+
 ### Payments
 
 **Not a real payment gateway.** `POST /api/payments/process` exists so
@@ -416,6 +539,7 @@ line in `MOCK_PROVIDER_CHECKS`, not a new mechanism.
 - **agentFee is still client-supplied**, since it's a legitimate per-booking discretionary value an agent sets — but nothing here bounds it (e.g. a max % cap), so an agent-facing client could currently submit an unreasonable fee.
 - **`paymentReference` is accepted from the client at booking-creation time without re-verification.** The reference itself IS genuinely server-generated (by `/api/payments/process`), but `create_booking` doesn't yet check that a given reference actually came from a real prior call to that endpoint before storing it. Closing this needs a payments ledger (issued references tracked and checked here) — see the comment above `payment_reference` in `models.py` for the full note.
 - **No real payment gateway.** `PAYMENT_PROVIDER` defaults to (and only has) `mock` — see its own section above for what integrating a real one requires.
+- **Cab dispatch (Phase 2) is built, but proves the pipeline, not a real integration.** The webhook, signature verification, WhatsApp+email notification, and the safety-net checking logic are all real and tested — see the cab dispatch section above. What's still missing: an actual cab supplier to ever call the real webhook, a real WhatsApp Business API account (`WHATSAPP_PROVIDER` is mock-only), and the external cron trigger for the safety-net endpoint (a Render dashboard step, not something committable to this repo).
 
 **CORS — now environment-conditional, not a manual-edit comment:**
 Previously this was `CORS(app)` (allow-all) with a comment saying "restrict this before going live" — exactly the kind of thing that's easy to forget. It's now driven by the same `DEPLOY_ENV` variable as the rate-limiter gate: staging defaults to allow-all (convenient for testing from anywhere), but `DEPLOY_ENV=production` makes `CORS_ORIGINS` mandatory and **refuses to start** without it. Set `CORS_ORIGINS` in staging too, any time you want to test the restricted behavior early.

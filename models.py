@@ -295,6 +295,92 @@ class FlightProviderLog(Base):
         }
 
 
+class CabProviderLog(Base):
+    """Same purpose as FlightProviderLog, mirrored exactly — one row per
+    supplier per search, so evaluating cab suppliers later is answerable
+    from real data. One extra dimension flight logging doesn't have:
+    won_on_reliability — a supplier can "win" a category either by being
+    the outright cheapest, or by being routed to despite NOT being
+    cheapest, because it was within the reliability-override threshold
+    (see cab_providers.RELIABILITY_OVERRIDE_THRESHOLD). Tracking this
+    separately matters for evaluation: a supplier winning mostly on
+    reliability overrides rather than price is a genuinely different
+    signal than one winning on price alone."""
+    __tablename__ = "cab_provider_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    search_id = Column(String(40), index=True, nullable=False)
+    pickup = Column(String(255))
+    drop_location = Column(String(255))
+    pickup_datetime = Column(String(40))
+
+    supplier = Column(String(30), index=True, nullable=False)
+    responded = Column(Boolean, nullable=False)
+    error = Column(String(255))
+    quote_count = Column(Integer, default=0)
+    lowest_landed_cost = Column(Float)
+    won_any_category = Column(Boolean, default=False)
+    won_on_reliability = Column(Boolean, default=False)  # won despite NOT being the cheapest for that category
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "searchId": self.search_id,
+            "pickup": self.pickup, "dropLocation": self.drop_location, "pickupDatetime": self.pickup_datetime,
+            "supplier": self.supplier, "responded": self.responded, "error": self.error,
+            "quoteCount": self.quote_count, "lowestLandedCost": self.lowest_landed_cost,
+            "wonAnyCategory": self.won_any_category, "wonOnReliability": self.won_on_reliability,
+            "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
+        }
+
+
+class CabDispatch(Base):
+    """Phase 2: driver assignment and notification status for a booked
+    cab transfer. Deliberately real, indexed columns rather than a JSON
+    blob — the safety-net job needs to QUERY 'which bookings have a
+    pickup in the next 60-90 minutes with no driver yet', which needs
+    real columns to filter on, not a scan through opaque JSON."""
+    __tablename__ = "cab_dispatches"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    booking_id = Column(String(32), index=True, nullable=False)
+    category = Column(String(30))
+    pickup_datetime = Column(String(40), index=True)  # ISO string — indexed, the safety-net job's core filter
+
+    driver_name = Column(String(255))
+    driver_phone = Column(String(20))
+    driver_rating = Column(Float)
+    vehicle_model = Column(String(100))
+    vehicle_registration = Column(String(30))
+    vehicle_color = Column(String(30))
+    live_tracking_url = Column(String(500))
+    dispatch_received_at = Column(DateTime)  # when a driver was actually assigned — null until then
+
+    whatsapp_sent = Column(Boolean, default=False)
+    whatsapp_sent_at = Column(DateTime)
+    email_sent = Column(Boolean, default=False)
+    email_sent_at = Column(DateTime)
+
+    safety_net_last_checked_at = Column(DateTime)
+    escalated_to_ops = Column(Boolean, default=False)  # true once both a poll AND its fallback have failed to find a driver
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "bookingId": self.booking_id, "category": self.category, "pickupDatetime": self.pickup_datetime,
+            "driverName": self.driver_name, "driverPhone": self.driver_phone, "driverRating": self.driver_rating,
+            "vehicleModel": self.vehicle_model, "vehicleRegistration": self.vehicle_registration, "vehicleColor": self.vehicle_color,
+            "liveTrackingUrl": self.live_tracking_url,
+            "dispatchReceivedAt": self.dispatch_received_at.isoformat() + "Z" if self.dispatch_received_at else None,
+            "whatsappSent": self.whatsapp_sent, "whatsappSentAt": self.whatsapp_sent_at.isoformat() + "Z" if self.whatsapp_sent_at else None,
+            "emailSent": self.email_sent, "emailSentAt": self.email_sent_at.isoformat() + "Z" if self.email_sent_at else None,
+            "escalatedToOps": self.escalated_to_ops,
+            "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
+        }
+
+
 class CallbackRequest(Base):
     """Lead capture for high-revenue product interest (currently: holiday
     packages). Captured by the support chat when someone asks about a

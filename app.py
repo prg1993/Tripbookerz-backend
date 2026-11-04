@@ -38,8 +38,11 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
-from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog, CallbackRequest, BookingAttempt, FlightProviderLog
+from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog, CallbackRequest, BookingAttempt, FlightProviderLog, CabProviderLog, CabDispatch
 import flight_providers
+import cab_providers
+import cab_dispatch
+from offer_tokens import verify_webhook_signature
 
 app = Flask(__name__)
 
@@ -319,6 +322,8 @@ def process_payment_via_provider(amount, currency, method):
 MOCK_PROVIDER_CHECKS = [
     ("PAYMENT_PROVIDER", [PAYMENT_PROVIDER], _PAYMENT_PROVIDERS_IS_MOCK),
     ("FLIGHT_PROVIDERS_ENABLED", flight_providers.FLIGHT_PROVIDERS_ENABLED, flight_providers.FLIGHT_PROVIDERS_IS_MOCK),
+    ("CAB_SUPPLIERS_ENABLED", cab_providers.CAB_SUPPLIERS_ENABLED, cab_providers.CAB_SUPPLIERS_IS_MOCK),
+    ("WHATSAPP_PROVIDER", [cab_dispatch.WHATSAPP_PROVIDER], cab_dispatch._WHATSAPP_PROVIDERS_IS_MOCK),
 ]
 
 
@@ -1320,6 +1325,207 @@ def reprice_flight():
     if not result["ok"]:
         return jsonify(success=False, error=result["error"]), 409
     return jsonify(success=True, **{k: v for k, v in result.items() if k != "ok"})
+
+
+# ---------- Cab/transfer search (multi-supplier aggregation) ----------
+# Same architecture as flights: actual supplier logic lives entirely in
+# cab_providers.py, these routes are deliberately thin.
+
+@app.route("/api/cabs/search", methods=["POST"])
+@rate_limit(max_calls=20, window_seconds=600)
+def search_cabs():
+    body = request.get_json(silent=True) or {}
+    pickup = (body.get("pickup") or "").strip()
+    drop = (body.get("drop") or "").strip()
+    pickup_dt = (body.get("pickupDatetime") or "").strip()
+    passengers = body.get("passengers")
+    luggage = body.get("luggageCount", 0)
+    requested_category = body.get("category")  # optional — filters to one category
+
+    if not pickup or not drop or not pickup_dt:
+        return jsonify(success=False, error="pickup, drop, and pickupDatetime are all required"), 400
+    if not isinstance(passengers, int) or passengers <= 0:
+        return jsonify(success=False, error="passengers must be a positive integer"), 400
+    if requested_category and requested_category not in cab_providers.VEHICLE_CATEGORIES:
+        return jsonify(success=False, error=f"Unknown category '{requested_category}'"), 400
+
+    quotes_by_category, supplier_log = cab_providers.aggregate_cab_quotes(
+        pickup, drop, pickup_dt, passengers, luggage, requested_category
+    )
+    default_cat, suggest_upgrade = cab_providers.default_category_for(passengers, luggage)
+
+    search_id = "CSRCH" + secrets.token_hex(8).upper()
+    if Session:
+        session = Session()
+        try:
+            for entry in supplier_log:
+                session.add(CabProviderLog(
+                    search_id=search_id, pickup=pickup, drop_location=drop, pickup_datetime=pickup_dt,
+                    supplier=entry["supplier"], responded=entry["responded"], error=entry["error"],
+                    quote_count=entry["quoteCount"], lowest_landed_cost=entry["lowestLandedCost"],
+                    won_any_category=entry.get("wonAnyCategory", False), won_on_reliability=entry.get("wonOnReliability", False),
+                ))
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            print(f"WARNING: failed to persist CabProviderLog for {search_id}: {e}")
+        finally:
+            session.close()
+    else:
+        print(f"WARNING: DATABASE_URL not configured — CabProviderLog for {search_id} was not persisted, but quotes are still returned.")
+
+    return jsonify(
+        success=True, searchId=search_id, quotesByCategory=quotes_by_category,
+        defaultCategory=default_cat, suggestUpgradeTo=suggest_upgrade,
+    )
+
+
+@app.route("/api/cabs/requote", methods=["POST"])
+@rate_limit(max_calls=20, window_seconds=600)
+def requote_cab():
+    """THE GUARDRAIL, called right before payment — mirrors
+    /api/flights/reprice exactly. See requote_cab()'s own docstring in
+    cab_providers.py for the fallback-failover contract."""
+    body = request.get_json(silent=True) or {}
+    token = body.get("cabOfferToken")
+    if not token:
+        return jsonify(success=False, error="cabOfferToken is required"), 400
+
+    result = cab_providers.requote_cab(token)
+    if not result["ok"]:
+        return jsonify(success=False, error=result["error"]), 409
+    return jsonify(success=True, **{k: v for k, v in result.items() if k != "ok"})
+
+
+@app.route("/api/admin/cab-provider-logs", methods=["GET"])
+@require_admin_auth
+@db_required
+def list_cab_provider_logs():
+    supplier_filter = request.args.get("supplier")
+    session = Session()
+    try:
+        q = session.query(CabProviderLog).order_by(CabProviderLog.created_at.desc())
+        if supplier_filter:
+            q = q.filter(CabProviderLog.supplier == supplier_filter)
+        return jsonify([e.to_dict() for e in q.limit(1000).all()])
+    finally:
+        session.close()
+
+
+# ---------- Cab dispatch (Phase 2): driver assignment + notification ----------
+# HONEST STATE: no real cab supplier exists to ever call the webhook
+# below on its own — see /api/admin/cab-dispatch/simulate, which
+# exercises the exact same processing path without one.
+
+@app.route("/webhooks/cab-dispatch", methods=["POST"])
+def cab_dispatch_webhook():
+    """The REAL webhook a genuine cab supplier would call once a driver
+    is assigned. Signature-verified — see offer_tokens.py's module
+    docstring for why this exists at all: without it, anyone who found
+    this URL could POST fake driver-assignment data against any
+    booking reference they guess or enumerate. A missing or invalid
+    signature is rejected before the body is even parsed as JSON.
+
+    Deliberately NOT using the @db_required decorator here — that
+    decorator runs before this function body, which would mean an
+    unauthenticated request with no valid signature at all could still
+    learn that the database happens to be down (a 500) before ever
+    being rejected for lacking a valid signature. Checking the
+    signature first, unconditionally, means a bad actor learns nothing
+    about backend state before being turned away."""
+    raw_body = request.get_data()  # exact raw bytes — signature must cover exactly what was sent, not a reparsed copy
+    signature = request.headers.get("X-Webhook-Signature")
+    if not verify_webhook_signature(raw_body, signature):
+        return jsonify(success=False, error="Invalid or missing webhook signature"), 401
+
+    if not Session:
+        return jsonify(success=False, error="Database not configured (DATABASE_URL missing)"), 500
+
+    body = request.get_json(silent=True) or {}
+    if body.get("event_type") != "DRIVER_DISPATCHED":
+        return jsonify(success=False, error=f"Unhandled event_type '{body.get('event_type')}'"), 400
+
+    session = Session()
+    try:
+        ok, result = cab_dispatch.process_dispatch_event(session, body, send_email_via_provider)
+        if not ok:
+            return jsonify(success=False, error=result), 404
+        return jsonify(success=True, **result)
+    finally:
+        session.close()
+
+
+@app.route("/api/admin/cab-dispatch/simulate", methods=["POST"])
+@require_admin_auth
+@db_required
+def simulate_cab_dispatch():
+    """Exercises the EXACT SAME processing path as the real webhook
+    above, without needing a real supplier to ever call it. This is
+    how the whole pipeline (signature concept aside — this endpoint is
+    admin-authenticated instead, since it's a deliberate internal
+    trigger, not something an external system calls) gets proven to
+    actually work end-to-end."""
+    body = request.get_json(silent=True) or {}
+    booking_ref = body.get("bookingId")
+    category = body.get("category", "SEDAN")
+    if not booking_ref:
+        return jsonify(success=False, error="bookingId is required"), 400
+
+    event = cab_dispatch.generate_mock_dispatch_event(booking_ref, category)
+    session = Session()
+    try:
+        ok, result = cab_dispatch.process_dispatch_event(session, event, send_email_via_provider)
+        if not ok:
+            return jsonify(success=False, error=result), 404
+        return jsonify(success=True, simulatedEvent=event, **result)
+    finally:
+        session.close()
+
+
+@app.route("/api/admin/cab-dispatch/safety-net-check", methods=["POST"])
+@require_admin_auth
+@db_required
+def cab_dispatch_safety_net_check():
+    """THE T-90-MINUTE SAFETY NET. Not an in-process scheduler — Flask
+    under Gunicorn isn't a place to run one (workers recycle). This is
+    an admin-protected endpoint meant to be triggered externally on a
+    schedule (a Render Cron Job or similar) every ~15 minutes, per the
+    source spec. Checks every cab dispatch with a pickup in the next
+    60-90 minutes that still has no driver assigned; polls the
+    (mocked) supplier for each; if the poll succeeds, processes the
+    dispatch exactly like a real webhook would; if it still comes back
+    empty, escalates (logged here, since there's no real ops
+    ticketing/paging system to page — stated plainly, not pretended)."""
+    now = datetime.utcnow()
+    window_start = (now + timedelta(minutes=60)).isoformat()
+    window_end = (now + timedelta(minutes=90)).isoformat()
+
+    session = Session()
+    try:
+        pending = session.query(CabDispatch).filter(
+            CabDispatch.pickup_datetime >= window_start,
+            CabDispatch.pickup_datetime <= window_end,
+            CabDispatch.driver_name.is_(None),
+        ).all()
+        counts = cab_dispatch.run_safety_net_check(session, pending, send_email_via_provider)
+        return jsonify(success=True, **counts)
+    finally:
+        session.close()
+
+
+@app.route("/api/admin/cab-dispatch", methods=["GET"])
+@require_admin_auth
+@db_required
+def list_cab_dispatches():
+    booking_filter = request.args.get("bookingId")
+    session = Session()
+    try:
+        q = session.query(CabDispatch).order_by(CabDispatch.created_at.desc())
+        if booking_filter:
+            q = q.filter(CabDispatch.booking_id == booking_filter)
+        return jsonify([e.to_dict() for e in q.limit(1000).all()])
+    finally:
+        session.close()
 
 
 # ---------- Bookings ----------

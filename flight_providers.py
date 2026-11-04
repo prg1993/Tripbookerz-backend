@@ -40,12 +40,9 @@ dedup logic are all provider-agnostic.
 import os
 import time
 import random
-import hmac
-import hashlib
-import json
-import base64
 import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from offer_tokens import make_signed_token, verify_signed_token
 
 # ---------- Configuration ----------
 # Comma-separated list of which mocked providers are actually queried.
@@ -64,15 +61,6 @@ FLIGHT_PROVIDERS_ENABLED = [
 # the slow ones and returning whatever DID respond in time. The
 # integration guide specifically calls for a 3-5 second window.
 FLIGHT_PROVIDER_TIMEOUT_SECONDS = float(os.environ.get("FLIGHT_PROVIDER_TIMEOUT_SECONDS", "4.0"))
-
-# Secret used to sign offer tokens (HMAC) so a client can't tamper with
-# which provider/offer/price a booking routes to. This is NOT the same
-# as ADMIN_API_KEY — a separate secret, so rotating one never affects
-# the other. Falls back to a random value if unset, which is fine for
-# a single always-running process but means tokens won't survive a
-# restart — set OFFER_TOKEN_SECRET for real deployments.
-OFFER_TOKEN_SECRET = os.environ.get("OFFER_TOKEN_SECRET") or secrets.token_hex(32)
-OFFER_TOKEN_TTL_SECONDS = 15 * 60  # an offer is only bookable for 15 minutes
 
 AIRLINES_FULL_SERVICE = ["Air India", "Vistara"]
 AIRLINES_LCC = ["IndiGo", "SpiceJet", "Akasa Air"]
@@ -350,44 +338,20 @@ def search_flights_aggregated(from_code, to_code, date):
 
 # ---------- Offer tokens: HMAC-signed, so a client can never alter which
 # provider/offer/price a booking actually routes to or charges ----------
+# Thin, flight-specific wrappers around the shared offer_tokens module
+# (see that file) — the actual signing/verification logic lives there
+# now, shared with cab_providers.py, not duplicated here.
 
 def make_offer_token(provider, provider_offer_id, fare_net):
-    payload = {
+    return make_signed_token({
         "provider": provider,
         "providerOfferId": provider_offer_id,
         "fareNet": fare_net,
-        "issuedAt": int(time.time()),
-    }
-    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-    sig = hmac.new(OFFER_TOKEN_SECRET.encode(), raw, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(raw).decode() + "." + base64.urlsafe_b64encode(sig).decode()
+    })
 
 
 def verify_offer_token(token):
-    """Returns (ok, payload_or_error). Checks the HMAC signature (so the
-    token can't have been tampered with client-side) and expiry (so a
-    stale offer from an hour ago can't be booked at a price nobody
-    re-validated)."""
-    try:
-        raw_b64, sig_b64 = token.split(".", 1)
-        raw = base64.urlsafe_b64decode(raw_b64.encode())
-        sig = base64.urlsafe_b64decode(sig_b64.encode())
-    except Exception:
-        return False, "Malformed offer token"
-
-    expected_sig = hmac.new(OFFER_TOKEN_SECRET.encode(), raw, hashlib.sha256).digest()
-    if not hmac.compare_digest(sig, expected_sig):
-        return False, "Offer token signature is invalid"
-
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        return False, "Malformed offer token payload"
-
-    if time.time() - payload.get("issuedAt", 0) > OFFER_TOKEN_TTL_SECONDS:
-        return False, "This offer has expired — please search again"
-
-    return True, payload
+    return verify_signed_token(token)
 
 
 def reprice_offer(token):

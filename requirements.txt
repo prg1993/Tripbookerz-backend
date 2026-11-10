@@ -3,3 +3,4 @@ flask-cors==4.0.1
 gunicorn==22.0.0
 SQLAlchemy==2.0.35
 psycopg2-binary==2.9.12
+cryptography==43.0.3

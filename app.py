@@ -23,8 +23,9 @@ Booking/data endpoints (backed by Postgres, not localStorage):
     POST   /api/campaigns           create a campaign
     GET    /api/campaigns           list campaigns
     PATCH  /api/campaigns/<id>      toggle active/paused
-    GET    /api/markup-config       get current platform markup
-    PUT    /api/markup-config       set platform markup
+    GET    /api/markup-config       get current platform fee (public)
+    GET    /api/fees/public         platform + convenience fee + GST (public)
+    GET/PUT /api/fees, /api/fees/charges, /api/fees/gst   staff only (see Stage 3b)
 """
 
 import os
@@ -32,14 +33,18 @@ import http.client
 import json
 import secrets
 import base64
+import hmac
 from urllib.parse import urlencode
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
-from models import make_session, Booking, Coupon, Campaign, MarkupConfig, Agent, AdminUser, AuditLog, CallbackRequest, BookingAttempt, FlightProviderLog, CabProviderLog, CabDispatch
+from models import make_session, Booking, Coupon, CouponApproval, CouponRedemption, Campaign, MarkupConfig, FeeConfig, Agent, AdminUser, AuditLog, CallbackRequest, BookingAttempt, FlightProviderLog, CabProviderLog, CabDispatch
 import flight_providers
+import staff_auth
+import coupon_rules
+import privacy_rules
 import cab_providers
 import cab_dispatch
 from offer_tokens import verify_webhook_signature
@@ -778,11 +783,23 @@ def resolve_admin_actor():
     """Checks X-Admin-Key (master key) OR Admin-Token (per-employee session).
     Returns an actor dict on success, or None if neither is valid."""
     provided_key = request.headers.get("X-Admin-Key")
-    if ADMIN_API_KEY and provided_key and provided_key == ADMIN_API_KEY:
+    if ADMIN_API_KEY and provided_key and staff_auth.safe_eq(provided_key, ADMIN_API_KEY):
         return {"type": "master_key", "id": None, "name": "Master key"}
 
+    # New two-step staff sessions. Until per-route permissions are mapped
+    # (later stages), the existing admin endpoints accept ONLY staff users
+    # holding the Admin role -- a Sales/Finance login must never reach them.
+    staff_token = request.headers.get("Staff-Token")
+    if staff_token:
+        st_actor = staff_auth.resolve_staff_actor(staff_token)
+        if st_actor and "admin" in st_actor["roles"] and not st_actor["mustChangePassword"]:
+            return st_actor
+        return None
+
+    # Legacy password-only token (no 2FA): honoured only while the legacy
+    # login is explicitly enabled.
     token = request.headers.get("Admin-Token")
-    if token and Session:
+    if token and Session and staff_auth.legacy_login_enabled():
         session = Session()
         try:
             admin = session.query(AdminUser).filter(AdminUser.session_token == hash_token(token)).first()
@@ -817,7 +834,7 @@ def require_master_key(fn):
     to mint more employee accounts (no privilege-escalation chain)."""
     def wrapper(*args, **kwargs):
         provided_key = request.headers.get("X-Admin-Key")
-        if not ADMIN_API_KEY or not provided_key or provided_key != ADMIN_API_KEY:
+        if not ADMIN_API_KEY or not provided_key or not staff_auth.safe_eq(provided_key, ADMIN_API_KEY):
             return jsonify(error="Unauthorized — master key required for account management"), 401
         g.actor = {"type": "master_key", "id": None, "name": "Master key"}
         return fn(*args, **kwargs)
@@ -826,16 +843,19 @@ def require_master_key(fn):
 
 
 
-def log_audit(session, action, target=None, details=None):
+def log_audit(session, action, target=None, details=None, reason=None, retain_until=None):
     """Writes one append-only audit row using the actor resolved by
     require_admin_auth. Call this AFTER a successful mutation, before
     session.commit() (or in the same commit) so the log and the change
     land together."""
     actor = getattr(g, "actor", None) or {"type": "unknown", "id": None, "name": "Unknown"}
     ip = get_client_ip()
+    if retain_until is None:
+        retain_until = datetime.utcnow() + timedelta(days=staff_auth.cfg()["audit_retain_days"])
     entry = AuditLog(
         actor_type=actor["type"], actor_id=actor["id"], actor_name=actor["name"],
         action=action, target=target, details=details, ip_address=ip,
+        reason=reason, retain_until=retain_until,
     )
     session.add(entry)
 
@@ -1086,6 +1106,7 @@ def agent_me(agent):
 
 @app.route("/api/agents", methods=["GET"])
 @require_admin_auth
+@staff_auth.require_access_reason("agents.list")
 @db_required
 def list_agents():
     status_filter = request.args.get("status")
@@ -1209,6 +1230,8 @@ def disable_admin_user(admin_id):
 @rate_limit(max_calls=10, window_seconds=600)
 @db_required
 def admin_login():
+    if not staff_auth.legacy_login_enabled():
+        return jsonify(error="Password-only staff sign-in is disabled. Use the staff portal's two-step sign-in."), 403
     body = request.get_json(silent=True) or {}
     email = body.get("email")
     password = body.get("password")
@@ -1568,7 +1591,7 @@ def create_booking():
         if session.get(Booking, body["bookingId"]):
             return jsonify(error="bookingId already exists"), 409
 
-        # Recompute platform fee from the server's own markup config.
+        # Recompute fees from the server's own settings, never from the client.
         cfg = session.get(MarkupConfig, 1)
         if not cfg:
             cfg = MarkupConfig(id=1, type="percent", value=8.0)
@@ -1576,34 +1599,47 @@ def create_booking():
         platform_fee = (
             round(net * cfg.value / 100) if cfg.type == "percent" else round(cfg.value)
         )
+        fc = _fee_config(session)
+        convenience_fee = (
+            round(net * fc.convenience_value / 100) if fc.convenience_type == "percent"
+            else round(fc.convenience_value)
+        )
 
         # Recompute discount from the real coupon row, if one was named —
-        # never trust a client-supplied discount amount directly.
+        # never trust a client-supplied discount amount directly. Rules
+        # (coupon_rules.py): a discount comes only out of the platform +
+        # convenience fee, never the fare or the agent's own markup; only
+        # active coupons can be used.
         discount = 0
         if coupon_code:
             coupon = session.get(Coupon, coupon_code)
-            if not coupon:
+            if not coupon or not coupon_rules.usable(coupon.status):
                 return jsonify(error="Coupon not found"), 400
-            today = datetime.utcnow().strftime("%Y-%m-%d")
+            today = coupon_rules.today_local()      # India date, not UTC
             if today < coupon.valid_from or today > coupon.valid_to:
                 return jsonify(error="Coupon not valid on this date"), 400
             if coupon.used >= coupon.max_uses:
                 return jsonify(error="Coupon usage limit reached"), 400
-            subtotal_before_discount = net + platform_fee + agent_fee
-            discount = (
-                round(subtotal_before_discount * coupon.value / 100)
-                if coupon.type == "percent" else round(coupon.value)
-            )
-            discount = min(discount, subtotal_before_discount)
-            # Atomic, race-safe redemption: only succeeds if still under cap.
+            discount = coupon_rules.compute_discount(
+                coupon.type, coupon.value, coupon.max_discount, bool(coupon.allow_over_ceiling),
+                net, platform_fee, convenience_fee, agent_fee)
+            # Atomic, race-safe redemption: only succeeds if still under cap
+            # and still active (a coupon disabled a moment ago stops here).
             result = session.query(Coupon).filter(
-                Coupon.code == coupon_code, Coupon.used < Coupon.max_uses
+                Coupon.code == coupon_code, Coupon.used < Coupon.max_uses,
+                (Coupon.status == None) | (Coupon.status == "active")  # noqa: E711
             ).update({Coupon.used: Coupon.used + 1})
             if result == 0:
                 session.rollback()
                 return jsonify(error="Coupon usage limit reached"), 400
 
-        total = net + platform_fee + agent_fee - discount
+        # GST is charged on Tripbookerz's own fees AFTER the discount. The
+        # agent's markup is the agent's own supply and is not taxed here
+        # (flagged for the owner's CA). Rate is stored on the booking.
+        taxable_fee = max(0, platform_fee + convenience_fee - discount)
+        gst_rate = float(fc.gst_percent or 0)
+        gst_amount = round(taxable_fee * gst_rate / 100)
+        total = net + platform_fee + convenience_fee + agent_fee - discount + gst_amount
 
         booking = Booking(
             booking_id=body["bookingId"],
@@ -1612,6 +1648,10 @@ def create_booking():
             title=body["title"],
             net_fare=net,
             platform_fee=platform_fee,
+            convenience_fee=convenience_fee,
+            gst_rate=gst_rate,
+            gst_amount=gst_amount,
+            coupon_code=(coupon_code or None),
             agent_fee=agent_fee,
             discount=discount,
             total=total,
@@ -1641,6 +1681,20 @@ def create_booking():
             details=body.get("details", {}),
         )
         session.add(booking)
+        if coupon_code:
+            # Same transaction as the booking: either both are saved or neither.
+            session.add(CouponRedemption(
+                coupon_code=coupon_code, booking_id=body["bookingId"],
+                coupon_kind=coupon.kind or "standard", campaign_id=coupon.campaign_id,
+                coupon_type=coupon.type, coupon_value=coupon.value,
+                created_by=coupon.created_by, approved_by=coupon.approved_by,
+                booking_kind=body["kind"], booked_by_role=body["role"],
+                net_fare=net, platform_fee=platform_fee, convenience_fee=convenience_fee,
+                agent_fee=agent_fee, discount=discount, gst_amount=gst_amount, total=total))
+            g.actor = {"type": "customer", "id": None, "name": "Customer booking"}
+            log_audit(session, "coupon.redeem", target=coupon_code,
+                      details={"bookingId": body["bookingId"], "discount": discount, "total": total,
+                               "usedAfter": coupon.used + 1, "maxUses": coupon.max_uses})
         session.commit()
         return jsonify(success=True, booking=booking.to_dict()), 201
     finally:
@@ -1649,6 +1703,7 @@ def create_booking():
 
 @app.route("/api/bookings", methods=["GET"])
 @require_admin_auth
+@staff_auth.require_access_reason("bookings.list")
 @db_required
 def list_bookings():
     role = request.args.get("role")
@@ -1664,6 +1719,7 @@ def list_bookings():
 
 @app.route("/api/bookings/<id_or_ref>", methods=["GET"])
 @require_admin_auth
+@staff_auth.require_access_reason("bookings.detail")
 @db_required
 def get_booking(id_or_ref):
     session = Session()
@@ -1787,6 +1843,7 @@ def create_callback_request():
 
 @app.route("/api/callback-requests", methods=["GET"])
 @require_admin_auth
+@staff_auth.require_access_reason("callbacks.list")
 @db_required
 def list_callback_requests():
     status_filter = request.args.get("status")
@@ -1873,6 +1930,7 @@ def log_booking_attempt():
 
 @app.route("/api/booking-attempts", methods=["GET"])
 @require_admin_auth
+@staff_auth.require_access_reason("booking_attempts.list")
 @db_required
 def list_booking_attempts():
     """?status=failed_partner|failed_persistence|succeeded to filter.
@@ -1914,92 +1972,382 @@ def list_flight_provider_logs():
         session.close()
 
 
-# ---------- Coupons ----------
+# ---------- Coupons (Stage 3) ----------
+# Permission-checked staff routes. Nothing here deletes a coupon: a coupon
+# that has been used must stay on record, so it is disabled instead.
+
+def _actor_ids():
+    a = getattr(g, "actor", None) or {}
+    return (str(a.get("id") or a.get("type") or "unknown"), a.get("name") or "Unknown")
+
 
 @app.route("/api/coupons", methods=["POST"])
-@require_admin_auth
+@staff_auth.require_staff("coupon.create")
 @db_required
 def create_coupon():
-    body = request.get_json(silent=True) or {}
-    required = ["code", "type", "value", "from", "to"]
-    missing = [f for f in required if f not in body]
-    if missing:
-        return jsonify(error=f"Missing fields: {', '.join(missing)}"), 400
-
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    clean, err = coupon_rules.validate_new(body)
+    if err:
+        return jsonify(error=err), 400
+    is_admin = "coupon.approve_large" in g.actor["permissions"]
+    status, reasons = coupon_rules.decide_status(clean, is_admin)
+    uid, uname = _actor_ids()
     session = Session()
     try:
-        code = body["code"].strip().upper()
-        if session.get(Coupon, code):
+        if session.get(Coupon, clean["code"]):
             return jsonify(error="Coupon code already exists"), 409
+        if clean["kind"] == "campaign" and not session.get(Campaign, clean["campaign_id"]):
+            return jsonify(error="That campaign does not exist"), 400
+        now = datetime.utcnow()
         coupon = Coupon(
-            code=code, type=body["type"], value=body["value"],
-            valid_from=body["from"], valid_to=body["to"],
-            max_uses=body.get("max", 1), used=0,
+            code=clean["code"], type=clean["type"], value=clean["value"],
+            valid_from=clean["valid_from"], valid_to=clean["valid_to"],
+            max_uses=clean["max_uses"], used=0, status=status,
+            max_discount=clean["max_discount"], kind=clean["kind"], campaign_id=clean["campaign_id"],
+            allow_over_ceiling=bool(clean["override"] and is_admin),
+            created_by=uid, created_by_name=uname, created_at=now,
         )
         session.add(coupon)
-        log_audit(session, "coupon.create", target=code, details={"type": body["type"], "value": body["value"], "from": body["from"], "to": body["to"], "max": body.get("max", 1)})
+        approval = None
+        if status == "pending_approval":
+            approval = CouponApproval(
+                coupon_code=clean["code"], requested_by=uid, requested_by_name=uname,
+                reasons=reasons, override_requested=clean["override"],
+                request_reason=clean["reason"] or None, status="pending",
+            )
+            session.add(approval)
+        log_audit(session, "coupon.create", target=clean["code"], reason=clean["reason"] or None,
+                  details={"type": clean["type"], "value": clean["value"], "max": clean["max_uses"],
+                           "maxDiscount": clean["max_discount"], "from": clean["valid_from"],
+                           "to": clean["valid_to"], "status": status, "kind": clean["kind"], "campaignId": clean["campaign_id"],
+                           "overrideCeiling": bool(clean["override"] and is_admin),
+                           "approvalReasons": reasons})
         session.commit()
-        return jsonify(success=True, coupon=coupon.to_dict()), 201
+        return jsonify(success=True, coupon=coupon.to_dict(), needsApproval=(status == "pending_approval"),
+                       approvalReasons=reasons), 201
     finally:
         session.close()
 
 
 @app.route("/api/coupons", methods=["GET"])
-@require_admin_auth
+@staff_auth.require_staff("coupon.view")
 @db_required
 def list_coupons():
     session = Session()
     try:
-        return jsonify([c.to_dict() for c in session.query(Coupon).all()])
+        rows = session.query(Coupon).order_by(Coupon.code).all()
+        return jsonify([c.to_dict() for c in rows])
     finally:
         session.close()
 
 
-@app.route("/api/coupons/<code>", methods=["DELETE"])
-@require_admin_auth
+@app.route("/api/coupons/analytics", methods=["GET"])
+@staff_auth.require_staff("coupon.view")
 @db_required
-def delete_coupon(code):
+def coupon_analytics():
+    """Per-coupon totals from the redemption records. No customer details."""
+    from sqlalchemy import func
+    session = Session()
+    try:
+        rows = session.query(
+            CouponRedemption.coupon_code, func.count(CouponRedemption.id),
+            func.coalesce(func.sum(CouponRedemption.discount), 0),
+            func.coalesce(func.sum(CouponRedemption.total), 0),
+            func.max(CouponRedemption.redeemed_at),
+        ).group_by(CouponRedemption.coupon_code).all()
+        return jsonify([{"code": r[0], "bookings": int(r[1]), "discountGiven": int(r[2]),
+                         "bookingValue": int(r[3]),
+                         "lastUsed": r[4].isoformat() + "Z" if r[4] else None} for r in rows])
+    finally:
+        session.close()
+
+
+@app.route("/api/coupons/<code>/disable", methods=["POST"])
+@staff_auth.require_staff("coupon.disable")
+@db_required
+def disable_coupon(code):
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    reason = str(body.get("reason") or "").strip()[:500]
+    if len(reason) < 10:
+        return jsonify(error="A reason of at least 10 characters is required"), 400
+    uid, _ = _actor_ids()
     session = Session()
     try:
         coupon = session.get(Coupon, code.strip().upper())
         if not coupon:
             return jsonify(error="Not found"), 404
-        log_audit(session, "coupon.delete", target=coupon.code, details={"type": coupon.type, "value": coupon.value, "used": coupon.used})
-        session.delete(coupon)
+        if coupon.status == "disabled":
+            return jsonify(error="Already disabled"), 409
+        before = coupon.status or "active"
+        coupon.status = "disabled"
+        coupon.disabled_by, coupon.disabled_at, coupon.disable_reason = uid, datetime.utcnow(), reason
+        # a still-pending request is withdrawn with it
+        session.query(CouponApproval).filter(
+            CouponApproval.coupon_code == coupon.code, CouponApproval.status == "pending"
+        ).update({CouponApproval.status: "rejected", CouponApproval.decided_by: uid,
+                  CouponApproval.decided_at: datetime.utcnow(),
+                  CouponApproval.decision_reason: "Coupon disabled: " + reason})
+        log_audit(session, "coupon.disable", target=coupon.code, reason=reason,
+                  details={"previousStatus": before, "used": coupon.used})
         session.commit()
-        return jsonify(success=True)
+        return jsonify(success=True, coupon=coupon.to_dict())
     finally:
         session.close()
 
 
+@app.route("/api/coupons/<code>", methods=["DELETE"])
+@staff_auth.require_staff("coupon.disable")
+def delete_coupon(code):
+    return jsonify(error="Coupons are not deleted. Use Disable so the record is kept."), 405
+
+
 @app.route("/api/coupons/<code>/use", methods=["POST"])
-@db_required
 def use_coupon(code):
-    """Validates the coupon (date window + usage cap) and atomically
-    increments its usage count via a single conditional UPDATE, so two
-    concurrent requests can't both succeed past the usage cap. Call this
-    at the moment a booking is confirmed, not just when the code is
-    applied at search time. (Note: /api/bookings does this same check
-    internally when a couponCode is passed to it directly.)"""
-    code = code.strip().upper()
+    """Retired in Stage 3. It was public and unauthenticated, so anyone could
+    burn a coupon's usage count. Redemption now happens only inside
+    /api/bookings, which re-checks every rule on the server."""
+    return jsonify(error="This endpoint has been retired"), 410
+
+
+@app.route("/api/approvals", methods=["GET"])
+@staff_auth.require_staff("coupon.approve_large")
+@db_required
+def list_approvals():
+    status = request.args.get("status", "pending")
     session = Session()
     try:
-        coupon = session.get(Coupon, code)
-        if not coupon:
-            return jsonify(valid=False, error="Coupon not found"), 404
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        if today < coupon.valid_from or today > coupon.valid_to:
-            return jsonify(valid=False, error="Coupon not valid on this date"), 400
+        q = session.query(CouponApproval)
+        if status in ("pending", "approved", "rejected"):
+            q = q.filter(CouponApproval.status == status)
+        rows = q.order_by(CouponApproval.id.desc()).limit(500).all()
+        out = [r.to_dict(session.get(Coupon, r.coupon_code)) for r in rows]
+        pending = session.query(CouponApproval).filter(CouponApproval.status == "pending").count()
+        return jsonify(items=out, pendingCount=pending)
+    finally:
+        session.close()
 
-        result = session.query(Coupon).filter(
-            Coupon.code == code, Coupon.used < Coupon.max_uses
-        ).update({Coupon.used: Coupon.used + 1})
-        if result == 0:
-            session.rollback()
-            return jsonify(valid=False, error="Coupon usage limit reached"), 400
+
+@app.route("/api/approvals/count", methods=["GET"])
+@staff_auth.require_staff("coupon.approve_large")
+@db_required
+def approvals_count():
+    session = Session()
+    try:
+        return jsonify(pendingCount=session.query(CouponApproval).filter(CouponApproval.status == "pending").count())
+    finally:
+        session.close()
+
+
+def _decide(approval_id, approve):
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    reason = str(body.get("reason") or "").strip()[:500]
+    if len(reason) < 10:
+        return jsonify(error="A reason of at least 10 characters is required"), 400
+    uid, uname = _actor_ids()
+    session = Session()
+    try:
+        ap = session.get(CouponApproval, approval_id)
+        if not ap:
+            return jsonify(error="Not found"), 404
+        if ap.status != "pending":
+            return jsonify(error="This request was already decided"), 409
+        # Maker-checker: nobody approves their own request.
+        if ap.requested_by == uid:
+            return jsonify(error="You cannot decide a request you made yourself"), 403
+        coupon = session.get(Coupon, ap.coupon_code)
+        if not coupon or coupon.status != "pending_approval":
+            return jsonify(error="The coupon is no longer awaiting approval"), 409
+        now = datetime.utcnow()
+        ap.status = "approved" if approve else "rejected"
+        ap.decided_by, ap.decided_by_name, ap.decided_at, ap.decision_reason = uid, uname, now, reason
+        if approve:
+            coupon.status = "active"
+            coupon.approved_by, coupon.approved_at = uid, now
+            coupon.allow_over_ceiling = bool(ap.override_requested)
+        else:
+            coupon.status = "rejected"
+        log_audit(session, "coupon.approve" if approve else "coupon.reject", target=coupon.code, reason=reason,
+                  details={"approvalId": ap.id, "requestedBy": ap.requested_by_name,
+                           "overrideCeiling": bool(approve and ap.override_requested)})
         session.commit()
-        session.refresh(coupon)
-        return jsonify(valid=True, coupon=coupon.to_dict())
+        return jsonify(success=True, approval=ap.to_dict(coupon))
+    finally:
+        session.close()
+
+
+@app.route("/api/approvals/<int:approval_id>/approve", methods=["POST"])
+@staff_auth.require_staff("coupon.approve_large")
+@db_required
+def approve_request(approval_id):
+    return _decide(approval_id, True)
+
+
+@app.route("/api/approvals/<int:approval_id>/reject", methods=["POST"])
+@staff_auth.require_staff("coupon.approve_large")
+@db_required
+def reject_request(approval_id):
+    return _decide(approval_id, False)
+
+
+# ---------- Privacy: retention, erasure, legal hold (Stage P) ----------
+# Admin only (privacy.manage). Nothing runs by itself: an Admin previews, then
+# runs, with a typed reason. Every run is audited with COUNTS only, never with
+# the personal data that was removed.
+
+def _anonymise_booking(b, now):
+    b.traveler_name = "Removed"
+    b.traveler_phone = None
+    b.traveler_email = None
+    b.details = privacy_rules.strip_pii(b.details)
+    b.anonymised_at = now
+
+
+def _retention_candidates(session, st, now):
+    """Rows the retention rules would touch right now."""
+    from models import StaffSession, PasswordResetToken
+    att_cut = privacy_rules.cutoff(st["attempts_days"], now)
+    cb_cut = privacy_rules.cutoff(st["callbacks_days"], now)
+    bk_cut = privacy_rules.cutoff(st["booking_anonymise_days"], now)
+    ses_cut = privacy_rules.cutoff(st["session_purge_days"], now)
+    attempts = session.query(BookingAttempt).filter(BookingAttempt.created_at < att_cut)
+    callbacks = session.query(CallbackRequest).filter(CallbackRequest.created_at < cb_cut)
+    bookings = [b for b in session.query(Booking).filter(Booking.created_at < bk_cut, Booking.anonymised_at == None).all()  # noqa: E711
+                if not b.legal_hold and (b.refund_status or "none") not in privacy_rules.OPEN_REFUND_STATES]
+    sessions = session.query(StaffSession).filter(StaffSession.expires_at < ses_cut)
+    resets = session.query(PasswordResetToken).filter(PasswordResetToken.expires_at < ses_cut)
+    return attempts, callbacks, bookings, sessions, resets
+
+
+@app.route("/api/privacy/retention", methods=["GET"])
+@staff_auth.require_staff("privacy.manage")
+@db_required
+def privacy_retention_preview():
+    st = privacy_rules.settings()
+    session = Session()
+    try:
+        attempts, callbacks, bookings, sessions, resets = _retention_candidates(session, st, datetime.utcnow())
+        return jsonify(settings=st, wouldRemove={
+            "bookingAttempts": attempts.count(), "callbackRequests": callbacks.count(),
+            "bookingsToAnonymise": len(bookings), "expiredStaffSessions": sessions.count(),
+            "expiredResetTokens": resets.count()})
+    finally:
+        session.close()
+
+
+@app.route("/api/privacy/retention/run", methods=["POST"])
+@staff_auth.require_staff("privacy.manage")
+@db_required
+def privacy_retention_run():
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    dry = body.get("dryRun", True) is not False
+    reason = str(body.get("reason") or "").strip()[:500]
+    if not dry and len(reason) < 10:
+        return jsonify(error="A reason of at least 10 characters is required"), 400
+    st = privacy_rules.settings()
+    now = datetime.utcnow()
+    session = Session()
+    try:
+        attempts, callbacks, bookings, sessions, resets = _retention_candidates(session, st, now)
+        counts = {"bookingAttempts": attempts.count(), "callbackRequests": callbacks.count(),
+                  "bookingsToAnonymise": len(bookings), "expiredStaffSessions": sessions.count(),
+                  "expiredResetTokens": resets.count()}
+        if not dry:
+            attempts.delete(synchronize_session=False)
+            callbacks.delete(synchronize_session=False)
+            for b in bookings:
+                _anonymise_booking(b, now)
+            sessions.delete(synchronize_session=False)
+            resets.delete(synchronize_session=False)
+            log_audit(session, "privacy.retention_run", target="retention", reason=reason,
+                      details={"counts": counts, "settings": st})
+            session.commit()
+        return jsonify(success=True, dryRun=dry, counts=counts)
+    finally:
+        session.close()
+
+
+@app.route("/api/privacy/erase", methods=["POST"])
+@staff_auth.require_staff("privacy.manage")
+@db_required
+def privacy_erase():
+    """Erase one person's data at their request, found by phone or email.
+    Staff verify who is asking BEFORE using this; the reference (ticket or
+    email id) is recorded. Preview first (default), then run."""
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    kind, value = privacy_rules.classify_identifier(body.get("identifier"))
+    if not kind:
+        return jsonify(error="Enter a phone number (10+ digits) or an email address"), 400
+    dry = body.get("dryRun", True) is not False
+    reference = str(body.get("reference") or "").strip()[:200]
+    reason = str(body.get("reason") or "").strip()[:500]
+    if not dry and (len(reason) < 10 or not reference):
+        return jsonify(error="A request reference and a reason of at least 10 characters are required"), 400
+    now = datetime.utcnow()
+    session = Session()
+    try:
+        if kind == "phone":
+            # Compare digits only, in Python: stored numbers may have spaces, dashes or +91.
+            bookings = [b for b in session.query(Booking).all() if privacy_rules.phone_tail(b.traveler_phone) == value]
+            attempts = [a for a in session.query(BookingAttempt).all() if privacy_rules.phone_tail(a.traveler_phone) == value]
+            callbacks = [c for c in session.query(CallbackRequest).all() if privacy_rules.phone_tail(c.phone) == value]
+        else:
+            bookings = [b for b in session.query(Booking).all() if (b.traveler_email or "").lower() == value]
+            attempts = [a for a in session.query(BookingAttempt).all() if (a.traveler_email or "").lower() == value]
+            callbacks = []
+        bookings = [b for b in bookings if not b.anonymised_at]
+        todo, skipped = [], []
+        for b in bookings:
+            why = privacy_rules.booking_skip_reason(b.legal_hold, b.refund_status, b.kind, b.details)
+            (skipped.append({"bookingId": b.booking_id, "reason": why}) if why else todo.append(b))
+        counts = {"bookingsAnonymised": len(todo), "bookingAttemptsDeleted": len(attempts),
+                  "callbackRequestsDeleted": len(callbacks), "bookingsKept": len(skipped)}
+        if not dry:
+            for a in attempts:
+                session.delete(a)
+            for c in callbacks:
+                session.delete(c)
+            for b in todo:
+                _anonymise_booking(b, now)
+            # The audit row never holds the phone/email: only a short fingerprint.
+            fp = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+            log_audit(session, "privacy.erase", target="person:" + fp, reason=reason,
+                      details={"reference": reference, "counts": counts, "kept": skipped})
+            session.commit()
+        return jsonify(success=True, dryRun=dry, counts=counts, kept=skipped)
+    finally:
+        session.close()
+
+
+@app.route("/api/privacy/hold", methods=["POST"])
+@staff_auth.require_staff("privacy.manage")
+@db_required
+def privacy_hold():
+    """Legal hold: stops a booking's personal data from ever being removed
+    while a dispute or legal matter is open. Lifting it needs a reason too."""
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    booking_id = str(body.get("bookingId") or "").strip()
+    hold = bool(body.get("hold"))
+    reason = str(body.get("reason") or "").strip()[:500]
+    if len(reason) < 10:
+        return jsonify(error="A reason of at least 10 characters is required"), 400
+    session = Session()
+    try:
+        b = session.get(Booking, booking_id)
+        if not b:
+            return jsonify(error="Booking not found"), 404
+        if hold and b.anonymised_at:
+            return jsonify(error="Personal data was already removed from this booking"), 409
+        b.legal_hold = hold
+        b.legal_hold_reason = reason if hold else None
+        log_audit(session, "privacy.hold" if hold else "privacy.hold_lift", target=booking_id, reason=reason)
+        session.commit()
+        return jsonify(success=True, bookingId=booking_id, legalHold=hold)
     finally:
         session.close()
 
@@ -2007,7 +2355,7 @@ def use_coupon(code):
 # ---------- Campaigns ----------
 
 @app.route("/api/campaigns", methods=["POST"])
-@require_admin_auth
+@staff_auth.require_staff("campaign.manage")
 @db_required
 def create_campaign():
     body = request.get_json(silent=True) or {}
@@ -2018,7 +2366,7 @@ def create_campaign():
         campaign = Campaign(title=body["title"], tag=body.get("tag", ""), active=True)
         session.add(campaign)
         session.flush()  # get campaign.id before logging, since it's autoincrement
-        log_audit(session, "campaign.create", target=str(campaign.id), details={"title": body["title"], "tag": body.get("tag", "")})
+        log_audit(session, "campaign.create", target=str(campaign.id), reason=(str(body.get("reason") or "").strip()[:500] or None), details={"title": body["title"], "tag": body.get("tag", "")})
         session.commit()
         return jsonify(success=True, campaign=campaign.to_dict()), 201
     finally:
@@ -2037,7 +2385,7 @@ def list_campaigns():
 
 
 @app.route("/api/campaigns/<int:campaign_id>", methods=["PATCH"])
-@require_admin_auth
+@staff_auth.require_staff("campaign.manage")
 @db_required
 def toggle_campaign(campaign_id):
     session = Session()
@@ -2071,26 +2419,156 @@ def get_markup_config():
 
 
 @app.route("/api/markup-config", methods=["PUT"])
-@require_admin_auth
-@db_required
 def set_markup_config():
-    body = request.get_json(silent=True) or {}
-    if "type" not in body or "value" not in body:
-        return jsonify(error="type and value are required"), 400
+    return jsonify(error="Retired. Fees are now changed in the staff portal (Fees & tax)."), 410
+
+
+# ---------- Fees and GST (Stage 3b) ----------
+# Platform fee (MarkupConfig) + convenience fee + GST. Sales Manager and Admin
+# may change the two fees (markup.manage); only Admin may change GST (gst.manage).
+
+def _fee_config(session):
+    fc = session.get(FeeConfig, 1)
+    if not fc:
+        fc = FeeConfig(id=1, convenience_type="flat", convenience_value=0.0, gst_percent=18.0)
+        session.add(fc)
+        session.flush()
+    return fc
+
+
+def _fee_limits():
+    def num(name, default):
+        try:
+            return float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return float(default)
+    return {"max_percent": num("FEE_MAX_PERCENT", 25), "max_flat": num("FEE_MAX_FLAT", 2000),
+            "max_gst": num("GST_MAX_PERCENT", 40)}
+
+
+def _fee_view(session):
+    cfg = session.get(MarkupConfig, 1)
+    if not cfg:
+        cfg = MarkupConfig(id=1, type="percent", value=8.0)
+        session.add(cfg)
+        session.flush()
+    fc = _fee_config(session)
+    return {"platform": {"type": cfg.type, "value": cfg.value},
+            "convenience": {"type": fc.convenience_type, "value": fc.convenience_value},
+            "gstPercent": fc.gst_percent}
+
+
+def _valid_fee(f, lim):
+    if not isinstance(f, dict) or f.get("type") not in ("percent", "flat"):
+        return None, "Each fee needs a type of 'percent' or 'flat'"
+    try:
+        v = float(f.get("value"))
+    except (TypeError, ValueError):
+        return None, "Fee value must be a number"
+    cap = lim["max_percent"] if f["type"] == "percent" else lim["max_flat"]
+    if v < 0 or v > cap:
+        return None, f"Fee value must be between 0 and {cap:g}"
+    return {"type": f["type"], "value": v}, None
+
+
+@app.route("/api/fees/public", methods=["GET"])
+@db_required
+def public_fees():
+    """What the customer site needs to show a price. Nothing sensitive."""
     session = Session()
     try:
-        cfg = session.get(MarkupConfig, 1)
-        if not cfg:
-            cfg = MarkupConfig(id=1)
-            session.add(cfg)
-        before = {"type": cfg.type, "value": cfg.value}
-        cfg.type = body["type"]
-        cfg.value = body["value"]
-        log_audit(session, "markup_config.update", target="markup_config", details={"before": before, "after": {"type": body["type"], "value": body["value"]}})
+        v = _fee_view(session)
         session.commit()
-        return jsonify(success=True, config=cfg.to_dict())
+        return jsonify(v)
     finally:
         session.close()
+
+
+@app.route("/api/fees", methods=["GET"])
+@staff_auth.require_staff("markup.manage")
+@db_required
+def get_fees():
+    session = Session()
+    try:
+        v = _fee_view(session)
+        session.commit()
+        v["canEditGst"] = "gst.manage" in g.actor["permissions"]
+        v["limits"] = _fee_limits()
+        return jsonify(v)
+    finally:
+        session.close()
+
+
+@app.route("/api/fees/charges", methods=["PUT"])
+@staff_auth.require_staff("markup.manage")
+@db_required
+def set_fee_charges():
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    reason = str(body.get("reason") or "").strip()[:500]
+    if len(reason) < 10:
+        return jsonify(error="A reason of at least 10 characters is required"), 400
+    lim = _fee_limits()
+    plat, e1 = _valid_fee(body.get("platform"), lim)
+    conv, e2 = _valid_fee(body.get("convenience"), lim)
+    if e1 or e2:
+        return jsonify(error=e1 or e2), 400
+    uid, _ = _actor_ids()
+    session = Session()
+    try:
+        before = _fee_view(session)
+        cfg = session.get(MarkupConfig, 1)
+        fc = _fee_config(session)
+        cfg.type, cfg.value = plat["type"], plat["value"]
+        fc.convenience_type, fc.convenience_value = conv["type"], conv["value"]
+        fc.updated_by, fc.updated_at = uid, datetime.utcnow()
+        log_audit(session, "fees.update", target="fee_config", reason=reason,
+                  details={"before": {k: before[k] for k in ("platform", "convenience")},
+                           "after": {"platform": plat, "convenience": conv}})
+        session.commit()
+        return jsonify(success=True, fees=_fee_view(session))
+    finally:
+        session.close()
+
+
+@app.route("/api/fees/gst", methods=["PUT"])
+@staff_auth.require_staff("gst.manage")
+@db_required
+def set_gst():
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    reason = str(body.get("reason") or "").strip()[:500]
+    if len(reason) < 10:
+        return jsonify(error="A reason of at least 10 characters is required"), 400
+    try:
+        rate = float(body.get("gstPercent"))
+    except (TypeError, ValueError):
+        return jsonify(error="GST must be a number"), 400
+    mx = _fee_limits()["max_gst"]
+    if rate < 0 or rate > mx:
+        return jsonify(error=f"GST must be between 0 and {mx:g}"), 400
+    uid, _ = _actor_ids()
+    session = Session()
+    try:
+        fc = _fee_config(session)
+        before = fc.gst_percent
+        fc.gst_percent, fc.updated_by, fc.updated_at = rate, uid, datetime.utcnow()
+        log_audit(session, "gst.update", target="fee_config", reason=reason,
+                  details={"before": before, "after": rate})
+        session.commit()
+        return jsonify(success=True, gstPercent=rate)
+    finally:
+        session.close()
+
+
+# ---------- Staff portal (Stage 1): two-step login, roles, sessions ----------
+staff_auth.init_staff_auth(app, {
+    "Session": Session,
+    "rate_limit": rate_limit,
+    "get_client_ip": get_client_ip,
+    "send_email": send_email_via_provider,
+    "is_master_key": lambda: bool(ADMIN_API_KEY) and staff_auth.safe_eq(request.headers.get("X-Admin-Key", ""), ADMIN_API_KEY),
+})
 
 
 from werkzeug.exceptions import HTTPException

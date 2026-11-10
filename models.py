@@ -8,7 +8,7 @@ shared, durable version of that same data.
 
 from datetime import datetime
 from sqlalchemy import (
-    create_engine, Column, String, Integer, Float, Boolean, DateTime, JSON, inspect, text
+    create_engine, Column, String, Integer, Float, Boolean, DateTime, JSON, Text, inspect, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -33,6 +33,15 @@ class Booking(Base):
     agent_fee = Column(Integer, nullable=False, default=0)
     discount = Column(Integer, nullable=False, default=0)
     total = Column(Integer, nullable=False)
+    # Stage 3b (nullable: bookings made before this have no GST breakdown).
+    convenience_fee = Column(Integer)
+    gst_rate = Column(Float)        # % in force when the booking was made (snapshot)
+    gst_amount = Column(Integer)    # GST on (platform + convenience - discount)
+    coupon_code = Column(String(50), index=True)   # coupon used, if any
+    # Privacy (Stage P). Nullable so the startup migration can add them.
+    legal_hold = Column(Boolean)                   # true = never anonymise (dispute / legal case)
+    legal_hold_reason = Column(String(500))
+    anonymised_at = Column(DateTime)               # when name/phone/email were removed
 
     booked_by_role = Column(String(20), nullable=False)  # customer | agent
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -81,6 +90,9 @@ class Booking(Base):
             "platformFee": self.platform_fee,
             "agentFee": self.agent_fee,
             "discount": self.discount,
+            "convenienceFee": self.convenience_fee or 0,
+            "gstRate": self.gst_rate,
+            "gstAmount": self.gst_amount or 0,
             "total": self.total,
             "role": self.booked_by_role,
             "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
@@ -112,12 +124,96 @@ class Coupon(Base):
     max_uses = Column(Integer, nullable=False, default=1)
     used = Column(Integer, nullable=False, default=0)
 
+    # Stage 3. All nullable so the additive startup migration can add them to
+    # the live table. status NULL = coupon made before Stage 3 = active.
+    status = Column(String(20))              # active | pending_approval | rejected | disabled
+    max_discount = Column(Integer)           # rupee cap per booking (needed for percent)
+    allow_over_ceiling = Column(Boolean)     # only an Admin can set this to true
+    created_by = Column(String(32))          # staff admin_id (or 'master_key')
+    created_by_name = Column(String(255))
+    created_at = Column(DateTime)
+    approved_by = Column(String(32))
+    approved_at = Column(DateTime)
+    disabled_by = Column(String(32))
+    disabled_at = Column(DateTime)
+    disable_reason = Column(String(500))
+    kind = Column(String(10))                # standard | campaign (NULL = standard)
+    campaign_id = Column(Integer)
+
     def to_dict(self):
         return {
+            "kind": self.kind or "standard", "campaignId": self.campaign_id,
             "code": self.code, "type": self.type, "value": self.value,
             "from": self.valid_from, "to": self.valid_to,
             "max": self.max_uses, "used": self.used,
+            "status": self.status or "active",
+            "maxDiscount": self.max_discount,
+            "overrideCeiling": bool(self.allow_over_ceiling),
+            "createdBy": self.created_by_name or self.created_by,
+            "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
+            "disableReason": self.disable_reason,
         }
+
+
+class CouponRedemption(Base):
+    """One row per booking that used a coupon, written in the same database
+    transaction as the booking. For analytics and audit: holds a snapshot of
+    the coupon and the money split, and no customer personal data."""
+    __tablename__ = "coupon_redemptions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    coupon_code = Column(String(50), nullable=False, index=True)
+    booking_id = Column(String(32), nullable=False, index=True)
+    redeemed_at = Column(DateTime, default=datetime.utcnow, index=True)
+    coupon_kind = Column(String(10))
+    campaign_id = Column(Integer, index=True)
+    coupon_type = Column(String(10))
+    coupon_value = Column(Float)
+    created_by = Column(String(32))
+    approved_by = Column(String(32))
+    booking_kind = Column(String(20))          # flight | hotel | itinerary | cab
+    booked_by_role = Column(String(20))        # customer | agent
+    net_fare = Column(Integer)
+    platform_fee = Column(Integer)
+    convenience_fee = Column(Integer)
+    agent_fee = Column(Integer)
+    discount = Column(Integer)
+    gst_amount = Column(Integer)
+    total = Column(Integer)
+
+
+class CouponApproval(Base):
+    """One row per coupon that needed an Admin decision. Never deleted."""
+    __tablename__ = "coupon_approvals"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    coupon_code = Column(String(50), nullable=False, index=True)
+    requested_by = Column(String(32))
+    requested_by_name = Column(String(255))
+    requested_at = Column(DateTime, default=datetime.utcnow)
+    reasons = Column(JSON)                   # why approval was needed
+    override_requested = Column(Boolean, default=False)
+    request_reason = Column(String(500))
+    status = Column(String(12), default="pending", index=True)   # pending | approved | rejected
+    decided_by = Column(String(32))
+    decided_by_name = Column(String(255))
+    decided_at = Column(DateTime)
+    decision_reason = Column(String(500))
+
+    def to_dict(self, coupon=None):
+        d = {
+            "id": self.id, "code": self.coupon_code, "status": self.status,
+            "requestedBy": self.requested_by_name or self.requested_by,
+            "requestedAt": self.requested_at.isoformat() + "Z" if self.requested_at else None,
+            "reasons": self.reasons or [], "overrideRequested": bool(self.override_requested),
+            "requestReason": self.request_reason,
+            "decidedBy": self.decided_by_name or self.decided_by,
+            "decidedAt": self.decided_at.isoformat() + "Z" if self.decided_at else None,
+            "decisionReason": self.decision_reason,
+        }
+        if coupon is not None:
+            d["coupon"] = coupon.to_dict()
+        return d
 
 
 class Campaign(Base):
@@ -146,6 +242,19 @@ class MarkupConfig(Base):
 
     def to_dict(self):
         return {"type": self.type, "value": self.value}
+
+
+class FeeConfig(Base):
+    """Single row (id=1). Platform fee itself stays in MarkupConfig; this holds
+    the convenience fee and the GST rate. GST is changed by Admin only."""
+    __tablename__ = "fee_config"
+
+    id = Column(Integer, primary_key=True, default=1)
+    convenience_type = Column(String(10), default="flat")     # percent | flat
+    convenience_value = Column(Float, default=0.0)
+    gst_percent = Column(Float, default=18.0)
+    updated_by = Column(String(32))
+    updated_at = Column(DateTime)
 
 
 class Agent(Base):
@@ -216,6 +325,22 @@ class AdminUser(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # ---- Staff portal Stage 1 additions (all nullable: ensure_schema_up_to_date
+    # only ever ADDs columns and never adds NOT NULL, so code must treat NULL
+    # as the safe default — see staff_auth.py). ----
+    # List of role names, e.g. ["staff", "sales"]. NULL/empty is treated as
+    # ["staff"] (least privilege), never as admin.
+    roles = Column(JSON)
+    # TOTP secret, encrypted at rest with STAFF_TOTP_ENC_KEY (Fernet).
+    totp_secret_enc = Column(Text)
+    totp_enabled = Column(Boolean)
+    totp_last_step = Column(Integer)          # last accepted 30s step (blocks code replay)
+    recovery_codes = Column(JSON)             # list of sha256 hashes; each single-use
+    failed_attempts = Column(Integer)
+    locked_until = Column(DateTime)
+    must_change_password = Column(Boolean)
+    password_changed_at = Column(DateTime)
+
     def to_dict(self):
         return {
             "adminId": self.admin_id,
@@ -241,10 +366,18 @@ class AuditLog(Base):
     details = Column(JSON)                                    # before/after or other context
     ip_address = Column(String(64))
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Staff portal Stage 1: the typed justification for sensitive access /
+    # admin sign-in, and the date after which this row may be purged
+    # (travel date + 1 year for booking-linked rows; created_at + default
+    # retention otherwise). NULL retain_until = never purged automatically.
+    reason = Column(Text)
+    retain_until = Column(DateTime, index=True)
 
     def to_dict(self):
         return {
             "id": self.id,
+            "reason": self.reason,
+            "retainUntil": self.retain_until.isoformat() + "Z" if self.retain_until else None,
             "actorType": self.actor_type,
             "actorId": self.actor_id,
             "actorName": self.actor_name,
@@ -254,6 +387,38 @@ class AuditLog(Base):
             "ip": self.ip_address,
             "ts": self.created_at.isoformat() + "Z" if self.created_at else None,
         }
+
+
+class StaffSession(Base):
+    """Server-side staff sessions AND the short-lived login challenges that
+    precede them. Only the SHA-256 of the token is stored. Revoking a row
+    (logout, disable, role change, password change) takes effect on the very
+    next request, which the old single-token-on-the-user-row design could not
+    do for more than one device."""
+    __tablename__ = "staff_sessions"
+
+    session_id = Column(String(64), primary_key=True)     # sha256(token)
+    admin_id = Column(String(32), nullable=False, index=True)
+    kind = Column(String(20), nullable=False)               # session | challenge_totp | challenge_enroll
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime)
+    ip_address = Column(String(64))
+    user_agent = Column(String(255))
+    reason = Column(Text)                                    # sign-in reason carried from password step
+
+
+class PasswordResetToken(Base):
+    """Single-use password-reset link tokens (hash only)."""
+    __tablename__ = "staff_password_resets"
+
+    token_hash = Column(String(64), primary_key=True)
+    admin_id = Column(String(32), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime)
+    ip_address = Column(String(64))
 
 
 class FlightProviderLog(Base):
